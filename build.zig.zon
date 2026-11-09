@@ -1,0 +1,22 @@
+.{
+    .name = .zmind,
+    .fingerprint = 0x4aab336a53900519,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        // dvui 用本地 zig-pkg/ 里的副本（该目录已 gitignore，是这台机器的本地包仓库）：
+        // 1) 构建完全离线，不受 github 可达性影响；
+        // 2) 原先的 git 依赖在解析 dvui zon 里未使用的 raylib 系 lazy 依赖时，
+        //    会把 raylib/raylib_zig 及其上游（raygui/emsdk）整条链拉进来做哈希
+        //    校验——上游内容漂移 + 断网都会卡死构建（2026-10-30 实测）。
+        // 路径依赖不做哈希校验；zig-pkg 里的 dvui 副本已裁掉未使用的后端依赖。
+        .dvui = .{
+            .path = "zig-pkg/dvui-0.6.0-dev-AQFJmVOFBAHGG3beOgA6ODE6IfhoZRWCXSwtW7oTbDqD",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

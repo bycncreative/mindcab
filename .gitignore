@@ -1,0 +1,7 @@
+zig-out/
+.zig-cache/
+zig-pkg/
+*.exe
+*.pdb
+.*/
+AGENTS.md
