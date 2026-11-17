@@ -15,11 +15,13 @@ const layout = @import("layout.zig");
 const docx = @import("docx.zig");
 const markdown = @import("markdown.zig");
 const recent_files = @import("recent_files.zig");
+const platform = @import("platform.zig");
+const zstring = @import("zstring.zig");
 
 const Allocator = std.mem.Allocator;
 
 /// 应用版本号（「帮助 → 关于」对话框展示）。
-pub const app_version = "2.0.0";
+pub const app_version = "2.0.1";
 
 /// 作者联系方式（「帮助 → 关于」对话框展示）。
 pub const app_author = "bingyecn@163.com";
@@ -152,6 +154,11 @@ pub const Doc = struct {
     /// 文档图片池：节点只存 img_ref（id），图片数据集中在这里。
     /// 不参与撤销快照（只增不删：撤销把引用撤掉后，重做还能找回同一份数据）。
     images: model.ImageStore = .{},
+    /// 文档字符串池：Node.text/note/link（不可变 ZString）的字节唯一所有者。
+    /// 与图片池同理不入快照——快照树与当前树按引用共享字符串，只有「改值」
+    /// 才构造新串；废弃的旧版本由 gcStrings 的 mark-sweep 回收（根集合见该函数）。
+    /// StringStore 无自引用指针，docs 数组扩容搬移 Doc 是安全的。
+    strings: zstring.StringStore,
 
     pub fn deinit(self: *Doc, gpa: Allocator) void {
         self.root.deinit(gpa);
@@ -161,6 +168,7 @@ pub const Doc = struct {
         self.redo_stack.deinit(gpa);
         self.selected_ids.deinit(gpa);
         self.images.deinit(gpa);
+        self.strings.deinit();
     }
 
     /// id 是否在多选集合里。
@@ -249,6 +257,14 @@ pub fn pathWithExt(alloc: Allocator, path: []const u8, ext: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, ext });
 }
 
+/// 把 n（含子树）的 id 从 *next 依次重新分配。粘贴节点片段时用，
+/// 避免剪贴板文本里的旧 id 与文档现有 id 冲突。
+fn reassignIds(n: *model.Node, next: *u32) void {
+    n.id = next.*;
+    next.* += 1;
+    for (n.children.items) |c| reassignIds(c, next);
+}
+
 /// 框选矩形与节点几何是否相交（边界相接不算）。
 fn rectHitsGeom(r: dvui.Rect, g: model.Geometry) bool {
     return r.x < g.x + g.w and g.x < r.x + r.w and r.y < g.y + g.h and g.y < r.y + r.h;
@@ -288,14 +304,9 @@ pub const App = struct {
     /// 整个生命周期只持有一个：导出成功或失败即清空。需要在 runPendingExport 后 free。
     pending_export_path: ?[]u8 = null,
 
-    // ---- 节点剪贴板（Ctrl+C / Ctrl+V）----
-    /// 复制下来的节点内容（浅拷贝：不含子节点，parent 为 null）。
-    /// 只在一份，重复 Ctrl+V 会反复以它为模板（不改动它本身）。
-    clipboard: ?*model.Node = null,
-    /// 复制时源节点的 id 与父节点 id：粘贴时新节点挂回同一个父节点，
-    /// 并尽量插在源节点后面（源或父已删则退回当前选中/根）。
-    clipboard_src_id: ?u32 = null,
-    clipboard_parent_id: ?u32 = null,
+    // ---- 系统剪贴板（Ctrl+C / Ctrl+V，见 cmdCopySelected / cmdPasteNode）----
+    /// 复制 = 序列化 `<node>…</node>` 写进系统剪贴板；粘贴 = 读剪贴板按内容分派
+    /// （节点 XML / 图片路径 / 普通文本 / 位图）。App 不保存剪贴板副本。
     /// pending_export_path 对应的导出格式，runPendingExport 按它分派。
     pending_export_kind: ExportKind = .png,
     /// 选图（FileAction.pick_image）的目标节点 id：挂起时记录，
@@ -342,6 +353,9 @@ pub const App = struct {
     /// 重挂父拖拽中的鼠标位置（画布坐标）：画布据此高亮当前落点目标节点。
     reparent_mx: f32 = 0,
     reparent_my: f32 = 0,
+    /// 图片区已按下、等松手才打开预览的节点 id（0 = 无挂起）。
+    /// 预览不能在 press 时打开：模态框会吞掉这次点击的 release。
+    image_press_id: u32 = 0,
 
     /// 侧栏「下一级节点」列表的拖动排序状态：正在拖的子节点当前下标
     /// （null = 没在拖）。换位时 seq 实时写入列表下标。
@@ -379,6 +393,24 @@ pub const App = struct {
     pending_field_snapshot: ?Snapshot = null,
     /// 画布内联编辑：进入编辑时压过快照（Esc 取消时把这份空快照丢掉）
     edit_snapshot_pushed: bool = false,
+    /// 帧序号：GC 的 trash 只在跨帧后释放（见 zstring.freeTrashOlderThan）。
+    /// main.guiFrame 每帧开头调用 tickFrame() 递增。
+    frame_epoch: u64 = 0,
+
+    // ---- 文本编辑草稿（text 改为不可变 ZString 后，输入框不能直接绑定
+    // 节点字节，一律先打进草稿 ArrayList，提交时才用 StringStore 构造新串）----
+    /// 画布内联编辑（标题/连线标题共用）的草稿；beginEdit 时以原文本初始化。
+    edit_draft: std.ArrayList(u8) = .empty,
+    /// 侧栏三个文本框（标题/正文/连线标题）各自的草稿与归属节点 id
+    ///（0 = 未初始化，下次渲染该字段时从节点文本重置）。
+    /// undo / 换标签 / 画布编辑提交等会改写节点文本的路径必须让归属失效
+    ///（invalidateSideDrafts），否则草稿会带着过期文本覆盖回来。
+    title_draft: std.ArrayList(u8) = .empty,
+    note_draft: std.ArrayList(u8) = .empty,
+    link_draft: std.ArrayList(u8) = .empty,
+    title_draft_node: u32 = 0,
+    note_draft_node: u32 = 0,
+    link_draft_node: u32 = 0,
 
     // ---- 背景色拾取的撤销会话 ----
     /// 侧栏取色器对同一节点连续调色（拖动取色框）只算一步撤销：
@@ -411,10 +443,13 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         if (self.pending_export_path) |p| self.gpa.free(p);
-        if (self.clipboard) |n| n.deinit(self.gpa);
         self.dropPendingFieldSnapshot();
         self.dropPendingColorSnapshot();
         self.drag_entries.deinit(self.gpa);
+        self.edit_draft.deinit(self.gpa);
+        self.title_draft.deinit(self.gpa);
+        self.note_draft.deinit(self.gpa);
+        self.link_draft.deinit(self.gpa);
         self.recent.deinit();
         for (self.docs.items) |*d| d.deinit(self.gpa);
         self.docs.deinit(self.gpa);
@@ -448,8 +483,10 @@ pub const App = struct {
 
     /// 新建标签页（示例脑图，方便首启预览）。
     pub fn cmdNewDoc(self: *App) !void {
-        const root = try self.buildSampleTree();
-        const index = self.appendDoc(root, 4, 1, "", self.next_untitled, .{}) catch |err| {
+        var strings = zstring.StringStore.init(self.gpa);
+        errdefer strings.deinit();
+        const root = try self.buildSampleTree(&strings);
+        const index = self.appendDoc(root, 4, 1, "", self.next_untitled, .{}, strings) catch |err| {
             root.deinit(self.gpa);
             return err;
         };
@@ -481,6 +518,9 @@ pub const App = struct {
     /// 关闭第 index 个标签；该文档有未保存修改时先弹确认框。
     pub fn cmdCloseTab(self: *App, index: usize) void {
         if (index >= self.docs.items.len) return;
+        // 先提交正在进行的画布内联编辑：关闭不经过画布失焦，不提交就会丢输入。
+        // 必须在判 dirty 之前——提交本身可能把文档改脏。
+        self.cmdCommitEdit();
         if (self.docs.items[index].dirty) {
             self.showConfirm(.close_tab, index);
             return;
@@ -491,16 +531,33 @@ pub const App = struct {
     /// 真正执行关闭：释放节点树、必要时补一个新文档、把活动下标夹回范围。
     fn closeTabAt(self: *App, index: usize) void {
         if (index >= self.docs.items.len) return;
-        self.clearEdit();
+        const closing_active = index == self.active;
+        // 关活动标签前先把绑在它身上的会话清干净：预备字段快照、预备取色快照、
+        // 侧栏草稿、内联编辑草稿都指向 dead 的字符串池，dead.deinit 之后全是
+        // 悬垂指针（见 docs/review-zstring-lifetime.md P1）。
+        // 关别的标签不动这些状态——它们属于活动文档，池也还活着。
+        if (closing_active) {
+            self.clearEdit();
+            self.text_focus_id = 0;
+            self.dropPendingFieldSnapshot();
+            self.endColorSession();
+            self.color_picker_open = false;
+            self.invalidateSideDrafts();
+            // 缩放/双击记录绑的是旧文档的节点 id，换到新活动文档后必须清零
+            self.resize_node_id = 0;
+            self.last_click_target = 0;
+        }
         var dead = self.docs.orderedRemove(index);
         dead.deinit(self.gpa);
         self.setStatus("已关闭标签页");
 
         if (self.docs.items.len == 0) {
             // 不允许 0 个标签：补一个示例文档，否则画布/侧栏无处可画
-            const root = self.buildSampleTree() catch null;
+            var strings = zstring.StringStore.init(self.gpa);
+            errdefer strings.deinit();
+            const root = self.buildSampleTree(&strings) catch null;
             if (root) |r| {
-                const idx = self.appendDoc(r, 4, 1, "", self.next_untitled, .{}) catch {
+                const idx = self.appendDoc(r, 4, 1, "", self.next_untitled, .{}, strings) catch {
                     r.deinit(self.gpa);
                     return;
                 };
@@ -509,15 +566,22 @@ pub const App = struct {
             }
             return;
         }
+        // 关掉的是活动标签前面的一个：后面的标签整体前移，活动下标要跟着减，
+        // 否则会「悄悄切到另一个文档」（min 夹紧只能兜住关最后一个的情况）。
+        if (index < self.active) self.active -= 1;
         self.active = @min(self.active, self.docs.items.len - 1);
     }
 
     /// 切换活动标签并清掉与旧标签绑定的临时状态（内联编辑、双击记录、取色器）。
     fn activateTab(self: *App, index: usize) void {
+        // 先把旧标签的内联编辑提交掉：cmdCommitEdit 用 self.doc() 定位节点，
+        // 必须发生在切 active 之前，否则会拿新文档的树去找旧 id（找不到就丢输入）。
+        self.cmdCommitEdit();
         self.active = index;
         self.clearEdit();
         self.text_focus_id = 0;
         self.dropPendingFieldSnapshot();
+        self.invalidateSideDrafts(); // 草稿按节点 id 记归属，不跨标签复用
         self.endColorSession();
         self.color_picker_open = false;
         // 缩放/双击记录都绑定旧标签的节点，一并清掉
@@ -526,7 +590,9 @@ pub const App = struct {
     }
 
     /// 把一棵节点树挂成新标签（不含切换激活），返回下标。
-    /// images 是随文档带入的图片池（打开文件时来自 loadEx，新建时传空）。
+    /// images 是随文档带入的图片池（打开文件时来自 loadEx，新建时传空）；
+    /// strings 是随文档带入的字符串池（节点 text/note/link 的字节所有者，
+    /// 打开文件时来自 loadEx，新建时调用方先 init 再用同一个池建树）。
     fn appendDoc(
         self: *App,
         root: *model.Node,
@@ -535,6 +601,7 @@ pub const App = struct {
         path: []const u8,
         untitled: u32,
         images: model.ImageStore,
+        strings: zstring.StringStore,
     ) !usize {
         var d = Doc{
             .gpa = self.gpa,
@@ -543,6 +610,7 @@ pub const App = struct {
             .selected_id = selected_id,
             .untitled = untitled,
             .images = images,
+            .strings = strings,
         };
         if (path.len > 0) _ = d.setPath(path);
         try self.docs.append(self.gpa, d);
@@ -553,14 +621,15 @@ pub const App = struct {
     }
 
     /// 新建文档用的示例树（中心主题 + 两个分支；连线默认无标题）。
-    fn buildSampleTree(self: *App) !*model.Node {
-        const root = try model.createNode(self.gpa, 1, "中心主题");
+    /// 文本字节写入 store（将来会随 appendDoc 一起挂进 Doc）。
+    fn buildSampleTree(self: *App, store: *zstring.StringStore) !*model.Node {
+        const root = try model.createNode(store, 1, "中心主题");
         root.bg = .{ .r = 0xff, .g = 0xf3, .b = 0xb0 }; // 示例：自定义背景色
         errdefer root.deinit(self.gpa);
-        try model.setNote(self.gpa, root, "可编辑标题与正文描述");
-        const c1 = try model.addChild(self.gpa, root, 2, "分支一");
-        try model.setNote(self.gpa, c1, "带正文描述的节点");
-        _ = try model.addChild(self.gpa, root, 3, "分支二");
+        try model.setNote(store, root, "可编辑标题与正文描述");
+        const c1 = try model.addChild(store, root, 2, "分支一");
+        try model.setNote(store, c1, "带正文描述的节点");
+        _ = try model.addChild(store, root, 3, "分支二");
         return root;
     }
 
@@ -611,6 +680,7 @@ pub const App = struct {
         };
         for (d.redo_stack.items) |*s| s.root.deinit(self.gpa);
         d.redo_stack.clearRetainingCapacity();
+        self.gcStrings();
         return true;
     }
 
@@ -621,6 +691,34 @@ pub const App = struct {
         if (d.undo_stack.items.len == 0) return;
         var last = d.undo_stack.pop().?;
         last.root.deinit(self.gpa);
+        self.gcStrings();
+    }
+
+    /// 字符串池的 mark-sweep 回收（见 zstring.zig 文件头）。
+    /// 根集合 = 当前树 + 撤销栈 + 重做栈 + 各预备快照（字段输入/取色会话）。
+    /// **调用纪律**：只在快照被挤掉 / redo 清空 / 旧树被 restoreDoc 换掉这些
+    /// 「垃圾真正产生」的时机调用；正在命令中途游离于树外的节点不允许存在
+    ///（本工程的重挂父流程先挂新父再 detach，无游离窗口，满足该前提）。
+    /// sweep 只把死块挪进 trash 延迟释放（帧中途的 dvui 控件可能还握着旧串
+    /// 切片），freeTrashOlderThan 在下一个帧才真正回收（同帧二次 GC 安全）。
+    /// 每帧开头调用：推进帧序号，让 GC 的 trash 有「是否已跨帧」的依据。
+    pub fn tickFrame(self: *App) void {
+        self.frame_epoch +%= 1;
+    }
+
+    fn gcStrings(self: *App) void {
+        const d = self.doc();
+        // 只释放上一帧及更早判死的块：同一帧里二次进 GC（pushSnapshot 后又
+        // dropLastUndo 等）不会提前 free 本帧 dvui 控件仍可能引用的旧串。
+        d.strings.freeTrashOlderThan(self.frame_epoch);
+        if (!d.strings.shouldGc()) return;
+        var g = d.strings.beginGcEpoch(self.frame_epoch);
+        model.markStrings(&g, d.root);
+        for (d.undo_stack.items) |*s| model.markStrings(&g, s.root);
+        for (d.redo_stack.items) |*s| model.markStrings(&g, s.root);
+        if (self.pending_field_snapshot) |s| model.markStrings(&g, s.root);
+        if (self.pending_color_snapshot) |s| model.markStrings(&g, s.root);
+        g.sweep();
     }
 
     fn snapshotDoc(self: *App, d: *Doc) ?Snapshot {
@@ -648,6 +746,9 @@ pub const App = struct {
         self.clearEdit();
         self.text_focus_id = 0;
         self.dropPendingFieldSnapshot();
+        // 新树的节点对象是全新的：侧栏草稿（按节点 id 记归属）必须失效，
+        // 否则下一帧会用旧树时期的草稿文本覆盖新树的文本
+        self.invalidateSideDrafts();
         // 取色会话的预备镜像拍的是旧树，撤销后继续用它会跳回多个步骤
         self.endColorSession();
         self.color_picker_open = false;
@@ -673,6 +774,7 @@ pub const App = struct {
         };
         self.restoreDoc(d, d.undo_stack.pop().?);
         self.reveal_selected = true; // 撤销可能把选中项挪回视口外
+        self.gcStrings(); // restoreDoc 换掉的旧树 = 一批死串，就地回收
         self.setStatus("已撤销");
     }
 
@@ -694,6 +796,7 @@ pub const App = struct {
         };
         self.restoreDoc(d, d.redo_stack.pop().?);
         self.reveal_selected = true;
+        self.gcStrings();
         self.setStatus("已重做");
     }
 
@@ -779,7 +882,7 @@ pub const App = struct {
         const d = self.doc();
         const target = self.selectedNode() orelse d.root;
         _ = self.pushUndo();
-        const n = model.addChild(self.gpa, target, d.next_id, "新节点") catch {
+        const n = model.addChild(&d.strings, target, d.next_id, "新节点") catch {
             self.setStatus("添加失败：内存不足");
             return;
         };
@@ -795,7 +898,7 @@ pub const App = struct {
         const d = self.doc();
         const target = self.selectedNode() orelse d.root;
         _ = self.pushUndo();
-        const n = model.addSibling(self.gpa, target, d.next_id, "新节点") catch {
+        const n = model.addSibling(&d.strings, target, d.next_id, "新节点") catch {
             self.setStatus("添加失败：内存不足");
             return;
         };
@@ -806,71 +909,145 @@ pub const App = struct {
         self.setStatus("已添加同级节点");
     }
 
-    /// 复制选中节点到应用内剪贴板（只复制节点自身，不含子节点）。
-    /// 不写系统剪贴板：跨程序粘贴没有意义，也避免把整棵子树序列化成文本。
+    /// 复制选中节点到系统剪贴板：序列化成 `<node>…</node>` 文本（只复制节点自身，
+    /// 不含子节点；图片内联 base64，跨文档粘贴也能还原）。其他程序可读可再粘回。
     pub fn cmdCopySelected(self: *App) void {
         const node = self.selectedNode() orelse {
             self.setStatus("请先选中要复制的节点");
             return;
         };
-        const copy = model.cloneShallow(self.gpa, node) catch {
+        const text = xml.serializeNodeFragment(self.gpa, node, &self.doc().images) catch {
             self.setStatus("复制失败：内存不足");
             return;
         };
-        if (self.clipboard) |old| old.deinit(self.gpa);
-        self.clipboard = copy;
-        self.clipboard_src_id = node.id;
-        self.clipboard_parent_id = if (node.parent) |p| p.id else null;
-        self.setStatus("已复制节点（不含子节点）");
+        defer self.gpa.free(text);
+        dvui.clipboardTextSet(text);
+        self.setStatus("已复制节点（不含子节点）——Ctrl+V 粘贴为同级新节点");
     }
 
-    /// 粘贴：以剪贴板内容新建一个节点，父节点与原来的相同（同级），
-    /// 并尽量插在原节点后面。原节点已删除时退回「父节点末尾」
-    /// （连父节点都没了就挂到根下），避免粘贴失败。
+    /// 粘贴系统剪贴板内容，按内容分派（必须先选中节点）：
+    /// 1. `<node …>` 开头的文本 → 反序列化新建节点，父节点与选中节点相同、
+    ///    插在选中节点之后（选中为根则挂到根下），id 从文档 next_id 重新分配；
+    /// 2. 图片文件路径（jpg/jpeg/png）→ 读文件设为选中节点的图片；
+    /// 3. 其他非空文本 → 直接作为选中节点的标题；
+    /// 4. 无文本（位图，如截图）→ 转 PNG 设为选中节点的图片。
     pub fn cmdPasteNode(self: *App) void {
-        const clip = self.clipboard orelse {
-            self.setStatus("剪贴板为空：先按 Ctrl+C 复制节点");
+        const sel = self.selectedNode() orelse {
+            self.setStatus("请先选中节点：粘贴需要一个目标（同级新节点 / 标题 / 图片）");
             return;
         };
-        const d = self.doc();
-        // 目标父节点：优先原节点的父；原父已删则用当前选中的父；再不行退回根
-        const parent: *model.Node = blk: {
-            if (self.clipboard_parent_id) |pid| {
-                if (model.find(d.root, pid)) |p| break :blk p;
-            }
-            if (self.selectedNode()) |sel| {
-                if (sel.parent) |p| break :blk p;
-            }
-            break :blk d.root;
-        };
-        // 先把内容克隆出来（不挂树）；失败时不动文档，也不多压一步撤销
-        const n = model.cloneShallow(self.gpa, clip) catch {
-            self.setStatus("粘贴失败：内存不足");
+        if (self.editing != .none) {
+            self.setStatus("正在编辑：先按 Esc 退出编辑再粘贴");
             return;
-        };
-        n.id = d.next_id;
-        // 插到原节点之后；原节点不在这个父节点里就追加到末尾
-        var idx: usize = parent.children.items.len;
-        if (self.clipboard_src_id) |sid| {
-            if (model.find(d.root, sid)) |src| {
-                if (src.parent == parent) {
-                    if (std.mem.indexOfScalar(*model.Node, parent.children.items, src)) |i| idx = i + 1;
-                }
-            }
         }
-        _ = self.pushUndo();
-        parent.children.insert(self.gpa, idx, n) catch {
+        // 剪贴板文本是帧 arena 所有，本帧内用完即弃，无需 free
+        const text = std.mem.trim(u8, dvui.clipboardText(), " \t\r\n\x0c");
+        if (std.mem.startsWith(u8, text, "<node")) {
+            self.pasteNodeFragment(sel, text);
+            return;
+        }
+        if (text.len > 0) {
+            if (self.pasteTextAsImage(sel, text)) return;
+            self.pasteTextAsTitle(sel, text);
+            return;
+        }
+        self.pasteClipboardImage(sel);
+    }
+
+    /// 剪贴板是 `<node>` XML：解析（内联图转进文档图片池）→ 换新 id → 同级插入。
+    /// pub 只为让测试直接驱动这条路径（剪贴板在无头窗口里没法用）。
+    pub fn pasteNodeFragment(self: *App, sel: *model.Node, text: []const u8) void {
+        const d = self.doc();
+        // 顺序要害：先压快照、再解析。解析会把新串写进文档字符串池，而此刻节点
+        // 还没挂上树，不属于 gcStrings 的任何一个根（当前树/撤销栈/重做栈/预备
+        // 快照）。pushUndo 里若恰好触发 GC（池里攒够了垃圾就会），新节点的
+        // text/note/link 会被判死回收，随后入树的节点就带着悬垂指针。
+        // 见 docs/review-zstring-lifetime.md P0。
+        const pushed = self.pushUndo();
+        const n = xml.parseNodeFragment(self.gpa, text, &d.images, &d.strings) catch |err| {
+            // 树没变：这份快照对应不到任何改动，丢掉（顺带回收刚解析出的无主串）
+            if (pushed) self.dropLastUndo();
+            self.setStatus(if (err == error.OutOfMemory)
+                "粘贴失败：内存不足"
+            else
+                "粘贴失败：剪贴板内容不是有效的节点 XML");
+            return;
+        };
+        // 全部换新 id（含片段里带了子节点的极端情况），避免与现有 id 冲突
+        var next = d.next_id;
+        reassignIds(n, &next);
+        const parent: *model.Node = sel.parent orelse d.root; // 选中根 → 挂根下
+        var idx: usize = parent.children.items.len;
+        if (sel.parent == parent) {
+            if (std.mem.indexOfScalar(*model.Node, parent.children.items, sel)) |i| idx = i + 1;
+        }
+        parent.children.ensureUnusedCapacity(self.gpa, 1) catch {
             n.deinit(self.gpa);
+            if (pushed) self.dropLastUndo(); // 同样：树没变，撤销步无意义
             self.setStatus("粘贴失败：内存不足");
             return;
         };
+        parent.children.insertAssumeCapacity(idx, n);
         n.parent = parent;
         parent.collapsed = false;
-        d.next_id += 1;
+        d.next_id = next;
         d.selectSingle(n.id);
         d.dirty = true;
         self.reveal_selected = true;
         self.setStatus("已粘贴节点（同级，不含子节点）");
+    }
+
+    /// 剪贴板文本是否按「图片路径」处理。返回 true 表示已按图片分派
+    ///（成功设置或给出失败提示），调用方不再把它当标题。
+    fn pasteTextAsImage(self: *App, sel: *model.Node, text: []const u8) bool {
+        var p = text;
+        // 常见的复制带引号路径 / file:// URL（file:///C:/dir/img.png）
+        if (p.len >= 2 and (p[0] == '"' or p[0] == '\'') and p[p.len - 1] == p[0]) {
+            p = p[1 .. p.len - 1];
+        }
+        if (std.ascii.startsWithIgnoreCase(p, "file:///")) p = p[8..];
+        const ext = std.fs.path.extension(p);
+        if (ext.len <= 1) return false;
+        const is_img = std.ascii.eqlIgnoreCase(ext[1..], "jpg") or
+            std.ascii.eqlIgnoreCase(ext[1..], "jpeg") or
+            std.ascii.eqlIgnoreCase(ext[1..], "png");
+        if (!is_img) return false;
+        const data = std.Io.Dir.cwd().readFileAlloc(self.io, p, self.gpa, std.Io.Limit.limited(64 * 1024 * 1024)) catch {
+            self.setStatus("粘贴图片失败：读不到文件");
+            return true;
+        };
+        defer self.gpa.free(data);
+        // type 记文件后缀（jpg/png），与「从磁盘加载图片」一致
+        const t = if (ext.len > 1) ext[1..] else "img";
+        self.cmdSetNodeImg(sel, t, data) catch {
+            self.setStatus("设置图片失败：内存不足");
+            return true;
+        };
+        return true;
+    }
+
+    /// 剪贴板普通文本 → 直接作为选中节点的标题（一步撤销）。
+    fn pasteTextAsTitle(self: *App, sel: *model.Node, text: []const u8) void {
+        _ = self.pushUndo();
+        model.setText(&self.doc().strings, sel, text) catch {
+            self.setStatus("粘贴失败：内存不足");
+            return;
+        };
+        self.doc().dirty = true;
+        self.setStatus("已把剪贴板文本粘贴为节点标题");
+    }
+
+    /// 剪贴板没有文本：尝试读位图（Windows CF_DIB → PNG）设为节点图片。
+    fn pasteClipboardImage(self: *App, sel: *model.Node) void {
+        const png = platform.clipboardImagePng(self.gpa) orelse {
+            self.setStatus("剪贴板没有可粘贴的内容（文本 / 图片）");
+            return;
+        };
+        defer self.gpa.free(png);
+        self.cmdSetNodeImg(sel, "png", png) catch {
+            self.setStatus("粘贴图片失败：内存不足");
+            return;
+        };
     }
 
     /// 删除选中节点及其子树（根节点不可删）。多选时一次全删，算一步撤销。
@@ -1086,7 +1263,7 @@ pub const App = struct {
             return;
         }
         _ = self.pushUndo();
-        model.setNote(self.gpa, node, "") catch {
+        model.setNote(&self.doc().strings, node, "") catch {
             self.setStatus("清除失败：内存不足");
             return;
         };
@@ -1105,7 +1282,7 @@ pub const App = struct {
             return;
         }
         _ = self.pushUndo();
-        model.setLink(self.gpa, node, "") catch {
+        model.setLink(&self.doc().strings, node, "") catch {
             self.setStatus("清除失败：内存不足");
             return;
         };
@@ -1169,7 +1346,7 @@ pub const App = struct {
     }
 
     /// 帧末消费选图请求：弹对话框选文件 → 读全部字节 → cmdSetNodeImg
-    /// （cmdSetNodeImg 按 md5 查图片池：已有同内容则复用同一 id，不重复存）。
+    /// （cmdSetNodeImg 按 md5 查图片池：md5 相同且内容一致则复用同一 uuid，不重复存）。
     fn runPickImage(self: *App) void {
         const target_id = self.pending_image_target_id orelse return;
         self.pending_image_target_id = null;
@@ -1208,7 +1385,7 @@ pub const App = struct {
         };
     }
 
-    /// 设置节点图片：按内容 md5 登记进文档图片池（同一张图复用同一 id），
+    /// 设置节点图片：按 md5 查图片池，相同内容复用同一 uuid（新图生成新 uuid），
     /// 节点只写引用。空 data 视为不设置。
     pub fn cmdSetNodeImg(self: *App, node: *model.Node, img_type: []const u8, data: []const u8) !void {
         if (data.len == 0) return;
@@ -1286,10 +1463,13 @@ pub const App = struct {
 
     fn beginEdit(self: *App, kind: EditKind, node: *model.Node) void {
         const cur = switch (kind) {
-            .node_title => node.text.items,
-            .edge_title => node.link.items,
+            .node_title => node.text.slice(),
+            .edge_title => node.link.slice(),
             .none => unreachable,
         };
+        // 草稿是输入缓冲：节点文本此刻还不变，提交时才构造新 ZString
+        self.edit_draft.clearRetainingCapacity();
+        self.edit_draft.appendSlice(self.gpa, cur) catch {};
         self.edit_backup_len = @min(cur.len, self.edit_backup.len - 1);
         @memcpy(self.edit_backup[0..self.edit_backup_len], cur[0..self.edit_backup_len]);
         // 进入编辑先压镜像：此刻文本还没被改，撤销一次就回到编辑前。
@@ -1302,11 +1482,29 @@ pub const App = struct {
         self.setStatus(if (kind == .node_title) "编辑节点标题：Enter 确认 · Esc 取消" else "编辑连线标题：Enter 确认 · Esc 取消");
     }
 
-    /// 确认编辑（Enter / 点到别处）。
+    /// 确认编辑（Enter / 点到别处）：把草稿提交为新 ZString。
+    /// （在此之前节点文本一直是编辑前的旧串——撤销快照在 beginEdit 时拍的
+    /// 就是它，输入过程中undo不会被草稿里的中间态污染。）
     pub fn cmdCommitEdit(self: *App) void {
         if (self.editing == .none) return;
         const kind = self.editing;
+        const id = self.editing_id;
+        const node = model.find(self.doc().root, id) orelse {
+            self.clearEdit();
+            return;
+        };
+        // 新串必须在 clearEdit **之前**构造：draft 指向 edit_draft 的缓冲区，
+        // 现在只因为 clearRetainingCapacity 不归还内存才侥幸有效，
+        // 哪天改成 deinit 就是 UAF（见 docs/review-zstring-lifetime.md P3）。
+        switch (kind) {
+            .node_title => if (!node.text.eqlSlice(self.edit_draft.items))
+                model.setText(&self.doc().strings, node, self.edit_draft.items) catch {},
+            .edge_title => if (!node.link.eqlSlice(self.edit_draft.items))
+                model.setLink(&self.doc().strings, node, self.edit_draft.items) catch {},
+            .none => {},
+        }
         self.clearEdit();
+        self.invalidateSideDrafts(); // 同一节点可能正显示在侧栏，草稿作废重取
         self.setStatus(if (kind == .node_title) "已更新节点标题" else "已更新连线标题");
     }
 
@@ -1327,8 +1525,8 @@ pub const App = struct {
             return;
         };
         switch (kind) {
-            .node_title => model.setText(self.gpa, node, backup) catch {},
-            .edge_title => model.setLink(self.gpa, node, backup) catch {},
+            .node_title => model.setText(&self.doc().strings, node, backup) catch {},
+            .edge_title => model.setLink(&self.doc().strings, node, backup) catch {},
             .none => {},
         }
         self.clearEdit();
@@ -1341,6 +1539,77 @@ pub const App = struct {
         self.edit_armed = false;
         self.edit_backup_len = 0;
         self.edit_snapshot_pushed = false;
+        self.edit_draft.clearRetainingCapacity();
+    }
+
+    // ---------------------------------------------------------------
+    // 侧栏文本框草稿（标题/正文/连线标题）
+    // ---------------------------------------------------------------
+
+    /// 让三个侧栏草稿在下一帧从节点文本重新初始化。
+    /// 节点文本被草稿以外的路径改掉时必须调用（画布编辑提交、undo 换树、
+    /// 换标签），否则草稿里的过期文本会在下次提交时把新值覆盖回去。
+    fn invalidateSideDrafts(self: *App) void {
+        self.title_draft_node = 0;
+        self.note_draft_node = 0;
+        self.link_draft_node = 0;
+    }
+
+    /// 侧栏标题输入框的草稿：第一次渲染该字段（或换节点/草稿失效）时
+    /// 以节点当前文本初始化，之后每帧直接续用（输入框的实时缓冲）。
+    pub fn sideTitleDraft(self: *App, node: *model.Node) *std.ArrayList(u8) {
+        if (self.title_draft_node != node.id) {
+            self.title_draft.clearRetainingCapacity();
+            self.title_draft.appendSlice(self.gpa, node.text.slice()) catch {};
+            self.title_draft_node = node.id;
+        }
+        return &self.title_draft;
+    }
+
+    /// 侧栏标题框内容变了：草稿 → 新 ZString（内容没变则不动节点），整个
+    /// 输入会话的撤销步由 commitTextFieldEdit 统一入栈。
+    pub fn commitSideTitle(self: *App, node: *model.Node) void {
+        if (!node.text.eqlSlice(self.title_draft.items)) {
+            model.setText(&self.doc().strings, node, self.title_draft.items) catch return;
+        }
+        self.commitTextFieldEdit();
+        self.cmdMarkDirty("标题已修改");
+    }
+
+    /// 侧栏正文描述输入框的草稿（同 sideTitleDraft）。
+    pub fn sideNoteDraft(self: *App, node: *model.Node) *std.ArrayList(u8) {
+        if (self.note_draft_node != node.id) {
+            self.note_draft.clearRetainingCapacity();
+            self.note_draft.appendSlice(self.gpa, node.note.slice()) catch {};
+            self.note_draft_node = node.id;
+        }
+        return &self.note_draft;
+    }
+
+    pub fn commitSideNote(self: *App, node: *model.Node) void {
+        if (!node.note.eqlSlice(self.note_draft.items)) {
+            model.setNote(&self.doc().strings, node, self.note_draft.items) catch return;
+        }
+        self.commitTextFieldEdit();
+        self.cmdMarkDirty("正文已修改");
+    }
+
+    /// 侧栏连线标题输入框的草稿（同 sideTitleDraft）。
+    pub fn sideLinkDraft(self: *App, node: *model.Node) *std.ArrayList(u8) {
+        if (self.link_draft_node != node.id) {
+            self.link_draft.clearRetainingCapacity();
+            self.link_draft.appendSlice(self.gpa, node.link.slice()) catch {};
+            self.link_draft_node = node.id;
+        }
+        return &self.link_draft;
+    }
+
+    pub fn commitSideLink(self: *App, node: *model.Node) void {
+        if (!node.link.eqlSlice(self.link_draft.items)) {
+            model.setLink(&self.doc().strings, node, self.link_draft.items) catch return;
+        }
+        self.commitTextFieldEdit();
+        self.cmdMarkDirty("连线标题已修改");
     }
 
     /// 当前正在编辑的节点（node_title = 节点本身；edge_title = 边的子节点端）。
@@ -1373,6 +1642,7 @@ pub const App = struct {
     /// 若该文件已在某个标签里，直接切到那个标签。
     /// 用户取消则保持原状。未启用 tinyfiledialogs 时退化为直接加载当前标签路径。
     pub fn cmdOpen(self: *App) void {
+        self.cmdCommitEdit(); // 打开新标签前先提交当前编辑
         if (!dvui.useTinyFileDialogs) {
             _ = self.openPathAsTab(self.doc().pathSlice());
             return;
@@ -1397,6 +1667,7 @@ pub const App = struct {
 
     /// 保存当前标签：已有路径直接写盘；未命名的新标签自动走「另存为」。
     pub fn cmdSave(self: *App) void {
+        self.cmdCommitEdit(); // 编辑中的标题先提交，否则存的是旧文本
         const d = self.doc();
         if (!d.hasPath()) {
             self.cmdSaveAs();
@@ -1407,6 +1678,7 @@ pub const App = struct {
 
     /// 另存为：弹系统保存对话框选定路径后写入（当前标签获得该路径）。
     pub fn cmdSaveAs(self: *App) void {
+        self.cmdCommitEdit(); // 同 cmdSave：提交编辑中的标题
         const d = self.doc();
         if (!dvui.useTinyFileDialogs) {
             // 无对话框可用：退化为写到最后一次用过的路径
@@ -1477,6 +1749,7 @@ pub const App = struct {
     }
 
     fn cmdExportPick(self: *App, kind: ExportKind) void {
+        self.cmdCommitEdit(); // 导出读的是节点树，编辑中的标题必须先落进树
         self.pending_export_kind = kind;
         const ext, const title, const filter_desc = switch (kind) {
             .png => .{ "png", "导出为 PNG", "PNG 图片 (*.png)" },
@@ -1667,6 +1940,122 @@ pub const App = struct {
         }
     }
 
+    /// 「图片预览」：点击节点图片弹出（canvas.drawNodes 的图片命中分支调用）。
+    /// 全窗口模态：占满整个 OS 窗口，标题栏 + Esc / 点击任意处 / 关闭按钮退出。
+    /// 图片字节直接引用文档图片池——模态框打开期间画布、侧栏、菜单全被挡住，
+    /// 撤销（快照不含图片池，池不被替换）也不会动这些字节，引用安全。
+    pub fn cmdShowImagePreview(self: *App, node: *model.Node) void {
+        const asset = self.imageAsset(node) orelse return;
+        // 资源指针进对话框数据（dataGet 每帧保活）。不传字节切片：
+        // dvui.dialog 的 user_struct 切片字段在本 dvui+zig0.17 组合下会被
+        // 当成单值存（stored []u8 single_item），dataGetSlice 取回直接 panic。
+        // 模态框打开期间文档不可改、图片池不被撤销快照替换，指针稳定。
+        dvui.dialog(@src(), .{
+            .asset = asset,
+        }, .{
+            .title = "图片预览",
+            .message = "",
+            .ok_label = "关闭",
+            .displayFn = imagePreviewDisplay,
+        });
+    }
+
+    /// 图片预览对话框的绘制：floatingWindow 直接给整窗 rect（区别于
+    /// aboutDisplay 的自适应小窗），图片在可用区内保持纵横比铺满。
+    fn imagePreviewDisplay(id: dvui.Id) !void {
+        const modal = dvui.dataGet(null, id, "_modal", bool) orelse {
+            dvui.dialogRemove(id);
+            return;
+        };
+        const title = dvui.dataGetSlice(null, id, "_title", []u8) orelse {
+            dvui.dialogRemove(id);
+            return;
+        };
+
+        // 保活用户数据（asset 指针）：本函数每帧 dataGet 即保活（Data 的
+        // 过期规则：一帧内没有任何 dataGet/dataSet 的键被释放）
+        const asset = dvui.dataGet(null, id, "asset", *model.ImageAsset) orelse {
+            dvui.dialogRemove(id);
+            return;
+        };
+
+        // 整窗 rect：既当初始尺寸也当居中基准（auto_pos 重心重算仍得全窗）；
+        // window_avoid = .none，否则「正好占满」会被当成重叠往下挤 24px
+        const win_r = dvui.windowRect();
+        var win = dvui.floatingWindow(@src(), .{
+            .modal = modal,
+            .center_on = win_r,
+            .window_avoid = .none,
+            .resize = .none, // 已占满整窗，边缘缩放无意义
+        }, .{
+            .role = .dialog,
+            .id_extra = id.asUsize(),
+            // Options.rect 是 Rect（natural 坐标的 none-flavor），windowRect 返回 Natural
+            .rect = dvui.Rect.cast(win_r),
+        });
+        defer win.deinit();
+
+        var header_openflag = true;
+        win.dragAreaSet(dvui.windowHeader(title, "", &header_openflag));
+        if (!header_openflag) {
+            dvui.dialogRemove(id);
+            return;
+        }
+
+        var vbox = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .margin = .all(8) });
+        defer vbox.deinit();
+
+        // 可用区（整窗减标题栏与边距）内等比缩放，但**只缩小、不放大**：
+        // 小图按原始像素尺寸居中显示，避免低分辨率图片被拉大后发虚。
+        // （placeIn 的 .ratio 会把小图也铺满可用区，所以再用自然尺寸夹一次。）
+        const avail = vbox.data().contentRect();
+        const source: dvui.ImageSource = .{ .imageFile = .{
+            .bytes = asset.data.items,
+            .name = if (asset.img_type.items.len > 0) asset.img_type.items else "png",
+            // 图片池内容只在节点编辑时变（模态期间不可能），.bytes 无妨
+            .invalidation = .bytes,
+        } };
+        const nat = dvui.imageSize(source) catch dvui.Size{ .w = avail.w, .h = avail.h };
+        const fit = dvui.placeIn(avail, nat, .ratio, .{ .x = 0.5, .y = 0.5 });
+        // 两个分量同取 min 不会破坏纵横比：大图时 fit 等比≤nat，小图时 nat≤fit。
+        const shown = dvui.Size{
+            .w = @min(nat.w, fit.w),
+            .h = @min(nat.h, fit.h),
+        };
+        const shown_rect = dvui.Rect{
+            .x = avail.x + (avail.w - shown.w) / 2,
+            .y = avail.y + (avail.h - shown.h) / 2,
+            .w = @max(shown.w, 1),
+            .h = @max(shown.h, 1),
+        };
+        _ = dvui.image(@src(), .{ .source = source, .shrink = .ratio }, .{
+            .rect = shown_rect,
+            .min_size_content = .{ .w = shown_rect.w, .h = shown_rect.h },
+            .label = .{ .text = "节点图片预览" },
+        });
+
+        // Esc / 点击任意处关闭。对话框绘制在 Window.end：此时 keys.afterWidgets
+        // 因 anyDialogOpen 已跳过全部按键，Esc 一定落到这里；
+        // 标题栏（拖动 / 关闭 X）与前面控件已把各自的事件标 handled，
+        // 能到这里还没被处理的 press 只可能是点在窗口背景或图片上。
+        for (dvui.events()) |*e| {
+            if (e.handled) continue;
+            switch (e.evt) {
+                .key => |ke| if (ke.action == .down and ke.code == .escape) {
+                    e.handle(@src(), win.data());
+                    dvui.dialogRemove(id);
+                    return;
+                },
+                .mouse => |me| if (me.action == .press) {
+                    e.handle(@src(), win.data());
+                    dvui.dialogRemove(id);
+                    return;
+                },
+                else => {},
+            }
+        }
+    }
+
     // ---------------------------------------------------------------
     // 最近打开的文件（%USERPROFILE%/.mindcab/history.toml）
     // ---------------------------------------------------------------
@@ -1727,9 +2116,10 @@ pub const App = struct {
         if (loaded.positioned) {
             layout.restoreSavedPositions(new_root, null, App.measureText);
         }
-        const index = self.appendDoc(new_root, model.maxId(new_root) + 1, new_root.id, path, 0, loaded.images) catch {
+        const index = self.appendDoc(new_root, model.maxId(new_root) + 1, new_root.id, path, 0, loaded.images, loaded.strings) catch {
             new_root.deinit(self.gpa);
             loaded.images.deinit(self.gpa);
+            loaded.strings.deinit();
             self.setStatus("打开失败：内存不足");
             return false;
         };

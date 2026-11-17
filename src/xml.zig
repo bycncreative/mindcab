@@ -3,10 +3,10 @@
 //! <?xml version="1.0" encoding="UTF-8"?>
 //! <mindmap version="2" position="true">
 //!   <images>
-//!     <img id="<md5>" type="png" md5="<md5>">BASE64图片数据</img>
+//!     <img id="<uuid>" type="png" md5="<md5>">BASE64图片数据</img>
 //!   </images>
 //!   <node id="1" text="中心主题" desc="可选的正文描述" left="48" top="60">
-//!     <img ref="<md5>" />
+//!     <img ref="<uuid>" />
 //!     <property name="权重">1</property>
 //!     <node id="2" text="分支" collapsed="1"/>
 //!   </node>
@@ -21,9 +21,9 @@
 //! bg = 节点自定义背景色 "#RRGGBB" / "#RRGGBBAA"（可省略，省略则跟随主题）。
 //! w / h = 用户手动调整的节点尺寸下限（整数，可省略；实际框取 max(自动, 手动)）。
 //! images = 文档级图片池：所有图片数据集中放这里（一份），节点只用
-//!          <img ref="..."/> 引用其 id。id 取图片内容的 md5（32 位小写十六进制），
-//!          因此同一张图片（内容相同）自动复用同一 id、文件里只存一份；
-//!          md5 属性是它的缓存值（与 id 相同），读取时可用来校验/复用。
+//!          <img ref="..."/> 引用其 id。id 为 uuid（32 位小写十六进制）；
+//!          md5 属性用于快速比较图片是否相同（先比 md5，相同再比真实内容），
+//!          同一张图片自动复用同一 uuid、文件里只存一份。
 //! property = 节点属性表一行（name 属性为名，正文为值，可多条按序显示）。
 //! version 2 起新增 img/property 与 images 池；version 1 的文件无这些元素，
 //! 天然兼容；2.0 早期把 base64 内联在节点 <img type="..."> 里的文件也能读
@@ -32,6 +32,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const model = @import("model.zig");
+const zstring = @import("zstring.zig");
 const Node = model.Node;
 
 pub const ParseError = error{
@@ -59,21 +60,21 @@ fn escapeInto(out: *std.ArrayList(u8), gpa: Allocator, s: []const u8) !void {
     };
 }
 
-fn writeNode(out: *std.ArrayList(u8), gpa: Allocator, node: *Node, depth: usize) !void {
+fn writeNode(out: *std.ArrayList(u8), gpa: Allocator, node: *Node, depth: usize, images: ?*const model.ImageStore, with_children: bool) !void {
     try out.appendNTimes(gpa, ' ', depth * 2);
     var idbuf: [16]u8 = undefined;
     const ids = try std.fmt.bufPrint(&idbuf, "{d}", .{node.id});
     try out.appendSlice(gpa, "<node id=\"");
     try out.appendSlice(gpa, ids);
     try out.appendSlice(gpa, "\" text=\"");
-    try escapeInto(out, gpa, node.text.items);
+    try escapeInto(out, gpa, node.text.slice());
     if (node.hasNote()) {
         try out.appendSlice(gpa, "\" desc=\"");
-        try escapeInto(out, gpa, node.note.items);
+        try escapeInto(out, gpa, node.note.slice());
     }
     if (node.hasLink()) {
         try out.appendSlice(gpa, "\" link=\"");
-        try escapeInto(out, gpa, node.link.items);
+        try escapeInto(out, gpa, node.link.slice());
     }
     if (node.seq != 0) {
         var seqbuf: [24]u8 = undefined;
@@ -119,21 +120,46 @@ fn writeNode(out: *std.ArrayList(u8), gpa: Allocator, node: *Node, depth: usize)
         return;
     }
     try out.appendSlice(gpa, "\">\n");
-    try writeExtras(out, gpa, node, depth);
-    for (node.children.items) |c| try writeNode(out, gpa, c, depth + 1);
+    try writeExtras(out, gpa, node, depth, images);
+    if (with_children) {
+        for (node.children.items) |c| try writeNode(out, gpa, c, depth + 1, images, true);
+    }
     try out.appendNTimes(gpa, ' ', depth * 2);
     try out.appendSlice(gpa, "</node>\n");
 }
 
-/// 写 <node> 开头标签之后的子元素：图片引用（<img ref="..." />）与属性表。
+/// 写 <node> 开头标签之后的子元素：图片引用与属性表。
 /// 缩进比节点本身再深一级（depth 传的是节点自身深度）。
-fn writeExtras(out: *std.ArrayList(u8), gpa: Allocator, node: *Node, depth: usize) !void {
+///
+/// images 传池时按「剪贴板序列化」写出：内联 base64（`<img type="...">…</img>`），
+/// 粘贴端（哪怕换一个文档）会把内联图转进目标文档图片池，不依赖池里已有 id；
+/// 池里找不到该 ref 时退回 `<img ref>`（画不出图的坏引用原样保留）。
+/// images 为 null（保存文件）按现有格式写 `<img ref="..." />`。
+fn writeExtras(out: *std.ArrayList(u8), gpa: Allocator, node: *Node, depth: usize, images: ?*const model.ImageStore) !void {
     const indent = (depth + 1) * 2;
     if (node.hasImg()) {
-        try out.appendNTimes(gpa, ' ', indent);
-        try out.appendSlice(gpa, "<img ref=\"");
-        try escapeInto(out, gpa, node.img_ref.items);
-        try out.appendSlice(gpa, "\" />\n");
+        var inlined = false;
+        if (images) |pool| {
+            if (pool.findById(node.img_ref.items)) |asset| {
+                try out.appendNTimes(gpa, ' ', indent);
+                try out.appendSlice(gpa, "<img type=\"");
+                try escapeInto(out, gpa, asset.img_type.items);
+                try out.appendSlice(gpa, "\">");
+                const Enc = std.base64.standard.Encoder;
+                const buf = try gpa.alloc(u8, Enc.calcSize(asset.data.items.len));
+                defer gpa.free(buf);
+                _ = Enc.encode(buf, asset.data.items);
+                try out.appendSlice(gpa, buf);
+                try out.appendSlice(gpa, "</img>\n");
+                inlined = true;
+            }
+        }
+        if (!inlined) {
+            try out.appendNTimes(gpa, ' ', indent);
+            try out.appendSlice(gpa, "<img ref=\"");
+            try escapeInto(out, gpa, node.img_ref.items);
+            try out.appendSlice(gpa, "\" />\n");
+        }
     }
     for (node.properties.items) |p| {
         try out.appendNTimes(gpa, ' ', indent);
@@ -201,8 +227,17 @@ pub fn save(root: *Node, images: *const model.ImageStore, gpa: Allocator) ![]u8 
     errdefer out.deinit(gpa);
     try out.appendSlice(gpa, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<mindmap version=\"2\" position=\"true\">\n");
     try writeImages(&out, gpa, root, images, 1);
-    try writeNode(&out, gpa, root, 1);
+    try writeNode(&out, gpa, root, 1, null, true);
     try out.appendSlice(gpa, "</mindmap>\n");
+    return try out.toOwnedSlice(gpa);
+}
+
+/// with_children = false（剪贴板片段）只写节点自身，不含子节点；
+/// 返回新分配文本，调用方负责 free。
+pub fn serializeNodeFragment(gpa: Allocator, node: *Node, images: *const model.ImageStore) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try writeNode(&out, gpa, node, 0, images, false);
     return try out.toOwnedSlice(gpa);
 }
 
@@ -214,11 +249,22 @@ const Parser = struct {
     s: []const u8,
     i: usize = 0,
     gpa: Allocator,
+    /// 节点 text/note/link 字节的去处（不可变 ZString，见 zstring.zig）。
+    /// 文档加载 = loadEx 自带的临时池（随 LoadResult 带回挂进 Doc）；
+    /// 剪贴板片段解析 = 调用方文档现役的池。
+    store: *zstring.StringStore,
     /// 文档图片池：<images> 块解析结果（节点 <img ref> 指向其中的 id）
     images: model.ImageStore = .{},
     /// mindmap 标签带 position="true"：节点属性里的 left/top 才有意义
     ///（解析时暂存进 geom.x/y，没写的节点用 NaN 占位）。
     positioned: bool = false,
+    /// 外接图片池（parseNodeFragment 用）：内联 `<img>` 的 base64 直接登记进
+    /// 调用方文档的图片池（md5 去重）；为 null 时用自带的 images（文档加载）。
+    images_ext: ?*model.ImageStore = null,
+
+    fn pool(self: *Parser) *model.ImageStore {
+        return self.images_ext orelse &self.images;
+    }
 
     fn peek(self: *const Parser) ?u8 {
         return if (self.i < self.s.len) self.s[self.i] else null;
@@ -341,22 +387,16 @@ const Parser = struct {
 
             if (std.mem.eql(u8, name, "text")) {
                 const t = try self.unescape(raw);
-                node.text.deinit(self.gpa);
-                node.text = .empty;
-                node.text.appendSlice(self.gpa, t) catch return error.OutOfMemory;
-                self.gpa.free(t);
+                defer self.gpa.free(t);
+                node.text = self.store.create(t) catch return error.OutOfMemory;
             } else if (std.mem.eql(u8, name, "desc") or std.mem.eql(u8, name, "note")) {
                 const t = try self.unescape(raw);
-                node.note.deinit(self.gpa);
-                node.note = .empty;
-                node.note.appendSlice(self.gpa, t) catch return error.OutOfMemory;
-                self.gpa.free(t);
+                defer self.gpa.free(t);
+                node.note = self.store.create(t) catch return error.OutOfMemory;
             } else if (std.mem.eql(u8, name, "link")) {
                 const t = try self.unescape(raw);
-                node.link.deinit(self.gpa);
-                node.link = .empty;
-                node.link.appendSlice(self.gpa, t) catch return error.OutOfMemory;
-                self.gpa.free(t);
+                defer self.gpa.free(t);
+                node.link = self.store.create(t) catch return error.OutOfMemory;
             } else if (std.mem.eql(u8, name, "collapsed")) {
                 node.collapsed = std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "true");
             } else if (std.mem.eql(u8, name, "seq")) {
@@ -440,12 +480,15 @@ const Parser = struct {
             const data = data_buf orelse continue; // 自闭合或坏数据：跳过该项
             var hexbuf: [32]u8 = undefined;
             const hex = model.md5Hex(data, &hexbuf);
-            // id 缺失时用 md5 兜底；md5 属性只作缓存/校验，以实际内容为准
-            const id_use = if (id.len > 0) id else hex;
+            // md5 相同 → 再比较真实内容：相同则复用已有 uuid，不重复登记
+            if (self.pool().findByMd5(hex)) |existing| {
+                if (std.mem.eql(u8, existing.data.items, data)) continue;
+            }
+            // id 缺失时生成新 uuid；md5 属性只作缓存，以实际内容计算为准
+            var uuidbuf: [8]u8 = undefined;
+            const id_use = if (id.len > 0) id else model.uuidHex(&uuidbuf);
             const md5_use = if (md5_attr.len > 0) md5_attr else hex;
-            // 同一内容（md5）已存在则不重复登记，保留先出现的 id
-            if (self.images.findByMd5(hex)) |_| continue;
-            _ = self.images.add(self.gpa, id_use, img_type, md5_use, data) catch return error.OutOfMemory;
+            _ = self.pool().add(self.gpa, id_use, img_type, md5_use, data) catch return error.OutOfMemory;
         }
     }
 
@@ -484,10 +527,16 @@ const Parser = struct {
         defer self.gpa.free(buf);
         var hexbuf: [32]u8 = undefined;
         const hex = model.md5Hex(buf, &hexbuf);
-        if (self.images.findByMd5(hex) == null) {
-            _ = self.images.add(self.gpa, hex, img_type, hex, buf) catch return error.OutOfMemory;
+        if (self.pool().findByMd5(hex)) |existing| {
+            if (std.mem.eql(u8, existing.data.items, buf)) {
+                model.setImgRef(self.gpa, node, existing.id.items) catch return error.OutOfMemory;
+                return;
+            }
         }
-        model.setImgRef(self.gpa, node, hex) catch return error.OutOfMemory;
+        var uuidbuf: [8]u8 = undefined;
+        const id = model.uuidHex(&uuidbuf);
+        _ = self.pool().add(self.gpa, id, img_type, hex, buf) catch return error.OutOfMemory;
+        model.setImgRef(self.gpa, node, id) catch return error.OutOfMemory;
     }
 
     /// 解析 <property name="权重">1</property>；name 缺省空串。
@@ -578,16 +627,21 @@ pub const LoadResult = struct {
     root: *Node,
     positioned: bool,
     images: model.ImageStore,
+    /// 节点 text/note/link 字节的池（挂进新 Doc 的 Doc.strings）。
+    strings: zstring.StringStore,
 
     pub fn deinit(self: *LoadResult, gpa: Allocator) void {
         self.root.deinit(gpa);
         self.images.deinit(gpa);
+        self.strings.deinit();
         self.* = undefined;
     }
 };
 
 pub fn loadEx(gpa: Allocator, data: []const u8) !LoadResult {
-    var p = Parser{ .s = data, .gpa = gpa };
+    var strings = zstring.StringStore.init(gpa);
+    errdefer strings.deinit();
+    var p = Parser{ .s = data, .gpa = gpa, .store = &strings };
     errdefer p.images.deinit(gpa);
     try p.skipMisc();
     try p.expect("<mindmap");
@@ -608,14 +662,26 @@ pub fn loadEx(gpa: Allocator, data: []const u8) !LoadResult {
     const root = try p.parseNode();
     try p.skipMisc();
     try p.expect("</mindmap");
-    return .{ .root = root, .positioned = p.positioned, .images = p.images };
+    return .{ .root = root, .positioned = p.positioned, .images = p.images, .strings = strings };
 }
 
-/// 解析整份文档，返回 root 节点（调用方负责 deinit）。
-/// 不关心 position 标记 / 图片的调用方用这个；要恢复视口位置用 loadEx、
-/// 要用节点图片用 loadEx（这里的图片池会随返回值释放）。
-pub fn load(gpa: Allocator, data: []const u8) !*Node {
-    var res = try loadEx(gpa, data);
-    res.images.deinit(gpa);
-    return res.root;
+// 注：原先的 `load()` 返回裸 root，却必须在返回前释放 strings 池——而 root 的
+// text/note/link 都指向池内字节，返回后全是悬垂指针（UAF）。节点文本改为
+// ZString 后「只返回树、不返回池」的 API 已无法成立，统一改用 loadEx：
+// 调用方拿 LoadResult，用 res.root 访问树、res.deinit 一并释放树/图片/字符串。
+
+/// 解析剪贴板里的 `<node>...</node>` 片段，返回节点（调用方负责 deinit）。
+/// 内联 `<img>`（base64）会登记进传入的 images 池（md5 去重）并转为节点引用；
+/// `<img ref="...">` 仅在同文档粘贴、池里已有该 id 时能画出图。
+/// text/note/link 写进传入的 strings 池（调用方文档现役的池）。
+/// 节点 id 原样保留，由调用方（App.cmdPasteNode）重新分配。
+pub fn parseNodeFragment(
+    gpa: Allocator,
+    data: []const u8,
+    images: *model.ImageStore,
+    strings: *zstring.StringStore,
+) !*Node {
+    var p = Parser{ .s = data, .gpa = gpa, .store = strings, .images_ext = images };
+    try p.skipMisc();
+    return try p.parseNode();
 }

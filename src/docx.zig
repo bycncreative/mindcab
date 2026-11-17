@@ -59,10 +59,10 @@ pub fn buildDocx(alloc: Allocator, root: *model.Node) ![]u8 {
 
 fn walkBody(alloc: Allocator, w: *std.Io.Writer, node: *model.Node, depth: u32) !void {
     // 标题文本：层级 ≤5 → HeadingN，更深 → 正文段落（level 0）
-    try writeParagraph(w, node.text.items, if (depth <= max_heading_level) depth else 0);
+    try writeParagraph(w, node.text.slice(), if (depth <= max_heading_level) depth else 0);
     // note（正文描述）跟在其后；按行拆成多段（Windows 换行 \r\n 去掉 \r）
     if (node.hasNote()) {
-        var it = std.mem.splitScalar(u8, node.note.items, '\n');
+        var it = std.mem.splitScalar(u8, node.note.slice(), '\n');
         while (it.next()) |line_raw| {
             const line = if (std.mem.endsWith(u8, line_raw, "\r")) line_raw[0 .. line_raw.len - 1] else line_raw;
             if (line.len == 0) continue;

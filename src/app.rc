@@ -19,14 +19,14 @@ BEGIN
   BEGIN
     BLOCK "080404B0"
     BEGIN
-      VALUE "CompanyName", "zmind"
-      VALUE "FileDescription", "mindcab - mind map editor"
+      VALUE "CompanyName", "bingyecn@163.com"
+      VALUE "FileDescription", "mindcab - 思维导图编辑器"
       VALUE "FileVersion", "2.0.0"
       VALUE "InternalName", "mindcab"
       VALUE "OriginalFilename", "mindcab.exe"
-      VALUE "ProductName", "mindcab"
+      VALUE "ProductName", "mindcab个人思维导图"
       VALUE "ProductVersion", "2.0.0"
-      VALUE "LegalCopyright", "Copyright (C) 2026 zmind"
+      VALUE "LegalCopyright", "Copyright (C) 2026 bingyecn@163.com"
     END
   END
   BLOCK "VarFileInfo"

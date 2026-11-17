@@ -117,6 +117,21 @@ pub fn drawMenuBar(app: *app_mod.App) void {
                 fw.close();
                 app.cmdDeleteSelected();
             }
+            // 复制/粘贴走系统剪贴板（序列化 <node>…</node> 文本为载体）。
+            // dvui 菜单项没有 disabled：未选中节点时粘贴用灰字标注，点击只有
+            // 状态栏提示、不产生任何修改（与上面撤销/重做同款约定）。
+            if (dvui.menuItemLabel(@src(), "复制节点    Ctrl+C", .{}, .{ .expand = .horizontal }) != null) {
+                fw.close();
+                app.cmdCopySelected();
+            }
+            const paste_label = if (app.selectedNode() == null)
+                "粘贴节点（未选中节点，不可粘贴）    Ctrl+V"
+            else
+                "粘贴节点    Ctrl+V";
+            if (dvui.menuItemLabel(@src(), paste_label, .{}, .{ .expand = .horizontal }) != null) {
+                fw.close();
+                app.cmdPasteNode();
+            }
         }
     }
     {
@@ -731,14 +746,13 @@ pub fn drawSidePanel(app: *app_mod.App) void {
         {
             var te = dvui.textEntry(@src(), .{
                 .placeholder = "节点标题",
-                .text = .{ .array_list = .{ .backing = &node.text, .allocator = app.gpa } },
+                .text = .{ .array_list = .{ .backing = app.sideTitleDraft(node), .allocator = app.gpa } },
             }, .{ .expand = .horizontal, .tag = "side_title" });
             defer te.deinit();
             // 撤销会话：聚焦时预备镜像，首次输入才入栈（整段输入算一步）
             app.trackTextField(te.data().id.asUsize());
             if (te.text_changed) {
-                app.commitTextFieldEdit();
-                app.cmdMarkDirty("标题已修改");
+                app.commitSideTitle(node);
             }
         }
 
@@ -759,7 +773,7 @@ pub fn drawSidePanel(app: *app_mod.App) void {
                 .placeholder = "留空则只显示标题",
                 .multiline = true, // 支持换行
                 .break_lines = true, // 超过最大宽度自动折行
-                .text = .{ .array_list = .{ .backing = &node.note, .allocator = app.gpa } },
+                .text = .{ .array_list = .{ .backing = app.sideNoteDraft(node), .allocator = app.gpa } },
                 // 高度由用户拖动把手决定（app.note_editor_h）；折行需要更高时
                 // 由 TextLayout 的最小尺寸自动撑大
             }, .{
@@ -770,8 +784,7 @@ pub fn drawSidePanel(app: *app_mod.App) void {
             defer te.deinit();
             app.trackTextField(te.data().id.asUsize());
             if (te.text_changed) {
-                app.commitTextFieldEdit();
-                app.cmdMarkDirty("正文已修改");
+                app.commitSideNote(node);
             }
         }
         drawNoteEditorGrip(app);
@@ -786,13 +799,12 @@ pub fn drawSidePanel(app: *app_mod.App) void {
             {
                 var te = dvui.textEntry(@src(), .{
                     .placeholder = "如：依赖 / 包含",
-                    .text = .{ .array_list = .{ .backing = &node.link, .allocator = app.gpa } },
+                    .text = .{ .array_list = .{ .backing = app.sideLinkDraft(node), .allocator = app.gpa } },
                 }, .{ .expand = .horizontal });
                 defer te.deinit();
                 app.trackTextField(te.data().id.asUsize());
                 if (te.text_changed) {
-                    app.commitTextFieldEdit();
-                    app.cmdMarkDirty("连线标题已修改");
+                    app.commitSideLink(node);
                 }
             }
             if (node.hasLink()) {
@@ -897,7 +909,7 @@ fn drawChildOrderRow(app: *app_mod.App, kids: []*model.Node, i: usize, c: *model
             .min_size_content = .{ .w = 12, .h = 12 },
             .color_text = .{ .color = dvui.themeGet().color(.content, .border) },
         });
-        dvui.label(@src(), "{s}", .{c.text.items}, .{ .gravity_y = 0.5, .padding = .{} });
+        dvui.label(@src(), "{s}", .{c.text.slice()}, .{ .gravity_y = 0.5, .padding = .{} });
 
         const dragging_this = app.seq_drag_index != null and app.seq_drag_index.? == i;
         if (dragging_this) {

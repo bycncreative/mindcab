@@ -99,6 +99,8 @@ pub fn main(init: std.process.Init) !void {
 
 /// 每帧 UI。返回 false 表示要退出。
 fn guiFrame(app: *app_mod.App) bool {
+    // 推进帧序号：字符串池 GC 的 trash 只允许跨帧释放
+    app.tickFrame();
     // 消费上一帧确认框的结果：对话框在 Window.end 阶段绘制，
     // 与 App 之间靠 app.zig 的模块级变量中转，所以要等到下一帧开头才能落地。
     app.runPendingConfirm();

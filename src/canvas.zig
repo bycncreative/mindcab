@@ -36,6 +36,17 @@ fn resizeZone(g: model.Geometry, px: f32, py: f32) app_mod.ResizeEdge {
     return .none;
 }
 
+/// 把图片自然尺寸「装进」边长 side 的正方形：保持纵横比，尽量铺满（允许放大）。
+/// 节点缩略图的图片区是固定的正方形，直接把方形尺寸喂给 dvui.image 会把
+/// 任意比例的图拉成方的（dvui 用 min_size_content 当内容尺寸渲染，不做 contain），
+/// 所以这里先算出等比适配后的尺寸，再由调用方靠左上摆放。
+/// 与预览窗口的区别：预览「只缩小不放大」（看细节），缩略图要「铺满」（看是什么图）。
+fn fitInSquare(nat: dvui.Size, side: f32) dvui.Size {
+    if (!(nat.w > 0) or !(nat.h > 0)) return .{ .w = side, .h = side };
+    const s = @min(side / nat.w, side / nat.h);
+    return .{ .w = @max(nat.w * s, 1), .h = @max(nat.h * s, 1) };
+}
+
 /// SDL 毫秒计时（dvui 没有时钟 API，双击判定靠它）。
 fn nowMs() i64 {
     return @intCast(SDLBackend.c.SDL_GetTicks());
@@ -226,7 +237,7 @@ fn edgeLabelRect(_: *app_mod.App, parent: *model.Node, child: *model.Node) ?dvui
     if (!child.hasLink()) return null;
     var pts: [edge_samples]dvui.Point.Natural = undefined;
     edgePoints(parent, child, &pts);
-    return labelBoxAt(pts[edge_samples / 2], child.link.items);
+    return labelBoxAt(pts[edge_samples / 2], child.link.slice());
 }
 
 /// 以连线中点为标签尺寸算出外框（无论有没有标题都可用，编辑空标题时兜底）。
@@ -290,7 +301,7 @@ fn drawEdges(app: *app_mod.App, node: *model.Node, rs: dvui.RectScale, depth: u3
         const editing_this = app.editing == .edge_title and app.editing_id == c.id;
         if (!editing_this) {
             if (edgeLabelRect(app, node, c)) |rect| {
-                dvui.label(@src(), "{s}", .{c.link.items}, .{
+                dvui.label(@src(), "{s}", .{c.link.slice()}, .{
                     .id_extra = c.id,
                     .rect = rect,
                     .font = app_mod.App.descFont(),
@@ -475,33 +486,47 @@ fn drawNodes(app: *app_mod.App, node: *model.Node, rs: dvui.RectScale, with_tags
         });
         defer b.deinit();
 
-        // 节点内容：可选图片图标 + 标题（正文字号）+ 可选正文描述（略小字号）
-        // + 可选属性表格（灰名格 / 浅绿值格，逐行贴在内容底部）。
+        // 节点内容：可选图片区（左侧正方形，最小 128×128）+ 标题 + 可选正文描述
+        // （有图时都在图片右侧；无图时正文通栏）+ 可选属性表格（灰名格 / 浅绿值格，
+        // 逐行贴在内容底部）。
         // 标签用显式 rect（相对节点内容区），不靠嵌套 box 布局——
         // 导出 PNG 的离屏 second pass 里 expand 布局标签不渲染（实测），
         // 显式 rect 与连线标题同款路径，两条路径都验证过。
+        // 图片命中区边长带出内层块：事件循环里判「点在图片上 = 打开预览」用
+        var img_side_e: f32 = 0;
+        var img_has_asset = false;
         {
             const cw = @max(node.geom.w - layout.metrics.pad_x * 2, 1);
             const title_font = dvui.themeGet().font_body;
             // 高度按多行测量（与 layout → measureMultiline 同一算法）：
             // 写死单行 textHeight() 会把第二行裁掉（report 缺陷 3）
-            const title_h = app_mod.App.measureMultiline(title_font, node.text.items).h;
+            const title_h = app_mod.App.measureMultiline(title_font, node.text.slice()).h;
             const has_img = node.hasImg();
-            // 首行：有图时标题右移（图标 + 间距），行高取标题与图标的较大者；
-            // 标题在首行内垂直居中（图标比标题高时不至于顶格）
-            const title_x: f32 = if (has_img) layout.metrics.img_icon + layout.metrics.img_gap else 0;
-            const first_line_h = if (has_img) @max(title_h, layout.metrics.img_icon) else title_h;
-            const title_y = if (has_img) (first_line_h - title_h) / 2.0 else 0;
+            // 有图节点 = 左右两列：左列正方形图片区（layout.imgSide：最小 128，
+            // 随右列撑高，图片保持纵横比），右列 = 标题 + 正文描述；
+            // 无图节点维持原布局（标题一行，正文在下方通栏）。
+            const desc_h: f32 = if (node.hasNote())
+                app_mod.App.measureMultiline(app_mod.App.descFont(), node.note.slice()).h
+            else
+                0;
+            const right_h = title_h + if (node.hasNote()) layout.metrics.desc_gap + desc_h else 0;
+            const img_side: f32 = if (has_img) layout.imgSide(right_h) else 0;
+            img_side_e = img_side;
+            // 池里真有这份图才可点（找不到的坏引用照旧不画、不可点）
+            img_has_asset = has_img and app.imageAsset(node) != null;
+            // 右列文字的左缘（相对节点内容区）
+            const text_x: f32 = if (has_img) img_side + layout.metrics.img_gap else 0;
+            // 文字块总高（属性表格 y 的基准）：有图 = max(图片区, 右列)；
+            // 无图 = 标题行 + 间距 + 正文
+            const text_block_h = if (has_img)
+                @max(img_side, right_h)
+            else
+                right_h;
 
             // 属性表格底色：用 Path 直接画矩形，**不要**用嵌套 dvui.box——
             // BoxWidget.init 会把自身设为当前父级，循环里第二个单元格就变成
             // 第一个单元格的子控件（rect 相对它定位），表现为值格向右下错位、
             // 后续文字标签也挂到错的父级。Path 用画布绝对坐标，不参与布局。
-            const text_block_h = first_line_h + if (node.hasNote())
-                layout.metrics.desc_gap + app_mod.App.measureMultiline(app_mod.App.descFont(), node.note.items).h
-            else
-                0;
-            // 表格与上方文字之间留半行间距（layout.measure 用同一常量，几何才对得上）
             const table_y = text_block_h + if (node.properties.items.len > 0) layout.metrics.prop_gap else 0;
             if (node.properties.items.len > 0) {
                 // 节点内容区左上角（画布坐标）：geom + 边框 + padding
@@ -536,22 +561,36 @@ fn drawNodes(app: *app_mod.App, node: *model.Node, rs: dvui.RectScale, with_tags
                 }
             }
 
-            // 图片图标：内容区左上角 24×24（显式 rect，离屏导出同样生效）。
+            // 图片区：内容区左上角正方形（显式 rect，离屏导出同样生效）。
+            // 图片在正方形内**等比铺满**（contain）并**靠左上对齐**：短边方向
+            // 的留白落在右侧/下方，不居中、绝不改比例。
+            // 注意不能把正方形直接当 min_size_content——dvui 的 image 把这个尺寸
+            // 当内容尺寸去渲染，方形尺寸会把任意比例的图拉伸。
             // 数据来自文档图片池（节点只存 ref）；池里找不到就不画（布局位照留）。
             if (has_img) {
                 if (app.imageAsset(node)) |asset| {
+                    const source: dvui.ImageSource = .{ .imageFile = .{
+                        .bytes = asset.data.items,
+                        .name = asset.img_type.items,
+                        // 撤销/重载会换内存地址，按字节内容识别变更更稳妥
+                        .invalidation = .bytes,
+                    } };
+                    const nat = dvui.imageSize(source) catch dvui.Size{ .w = img_side, .h = img_side };
+                    const fit = fitInSquare(nat, img_side);
                     _ = dvui.image(@src(), .{
-                        .source = .{ .imageFile = .{
-                            .bytes = asset.data.items,
-                            .name = asset.img_type.items,
-                            // 撤销/重载会换内存地址，按字节内容识别变更更稳妥
-                            .invalidation = .bytes,
-                        } },
+                        .source = source,
                         .shrink = .ratio,
                     }, .{
                         .id_extra = node.id,
-                        .rect = .{ .x = 0, .y = 0, .w = layout.metrics.img_icon, .h = layout.metrics.img_icon },
-                        .min_size_content = .{ .w = layout.metrics.img_icon, .h = layout.metrics.img_icon },
+                        // 在正方形图片区内**靠左上**（只留白，不裁切）：
+                        // 短边方向的留白全部落在右侧/下方，视觉上与节点文字同基线
+                        .rect = .{
+                            .x = 0,
+                            .y = 0,
+                            .w = fit.w,
+                            .h = fit.h,
+                        },
+                        .min_size_content = .{ .w = fit.w, .h = fit.h },
                         .label = .{ .text = "节点图片" },
                     });
                 }
@@ -559,9 +598,9 @@ fn drawNodes(app: *app_mod.App, node: *model.Node, rs: dvui.RectScale, with_tags
 
             // 正在双击编辑这个节点的标题时，标题让位给画布上的输入框
             if (!(app.editing == .node_title and app.editing_id == node.id)) {
-                dvui.label(@src(), "{s}", .{node.text.items}, .{
+                dvui.label(@src(), "{s}", .{node.text.slice()}, .{
                     .id_extra = node.id,
-                    .rect = .{ .x = title_x, .y = title_y, .w = @max(cw - title_x, 1), .h = title_h },
+                    .rect = .{ .x = text_x, .y = 0, .w = @max(cw - text_x, 1), .h = title_h },
                     // dvui 标签默认 padding 6，会把节点撑高（布局按文本尺寸算）
                     .padding = .{},
                     .color_text = text_color,
@@ -569,13 +608,13 @@ fn drawNodes(app: *app_mod.App, node: *model.Node, rs: dvui.RectScale, with_tags
             }
 
             if (node.hasNote()) {
-                const desc_h = app_mod.App.measureMultiline(app_mod.App.descFont(), node.note.items).h;
-                dvui.label(@src(), "{s}", .{node.note.items}, .{
+                // 正文在标题下方（有图时与标题同列，都排在图片右侧）
+                dvui.label(@src(), "{s}", .{node.note.slice()}, .{
                     .id_extra = node.id,
                     .rect = .{
-                        .x = 0,
-                        .y = first_line_h + layout.metrics.desc_gap,
-                        .w = cw,
+                        .x = text_x,
+                        .y = title_h + layout.metrics.desc_gap,
+                        .w = @max(cw - text_x, 1),
                         .h = desc_h,
                     },
                     .font = app_mod.App.descFont(),
@@ -633,7 +672,18 @@ fn drawNodes(app: *app_mod.App, node: *model.Node, rs: dvui.RectScale, with_tags
                         .press => if (me.button.pointer()) {
                             e.handle(@src(), b.data());
                             const mp = rs.pointFromPhysical(me.p);
+                            // 是否点在图片区（内容区 = geom + 边框 + padding 的
+                            // 左上角 img_side²）。图片区**不**另起一套手势：按下
+                            // 照常选中 + 预备拖拽，只在松手时判断「没拖动过」才算
+                            // 点击，进而打开预览（见 .release 分支）。
                             const zone = resizeZone(node.geom, mp.x, mp.y);
+                            const img_lx = mp.x - (node.geom.x + bw + layout.metrics.pad_x);
+                            const img_ly = mp.y - (node.geom.y + bw + layout.metrics.pad_y);
+                            const on_img = img_has_asset and !me.mod.shift() and
+                                zone == .none and
+                                img_lx >= 0 and img_ly >= 0 and
+                                img_lx < img_side_e and img_ly < img_side_e;
+                            app.image_press_id = if (on_img) node.id else 0;
                             if (me.mod.shift()) {
                                 // shift+按下：多选与重挂父共用入口。
                                 // 不在多选里就先加入（主选中跟手）；原本就在的，
@@ -676,9 +726,11 @@ fn drawNodes(app: *app_mod.App, node: *model.Node, rs: dvui.RectScale, with_tags
                                 app.resize_start_mx = mp.x;
                                 app.resize_start_my = mp.y;
                                 app.resize_snapshot_pushed = false;
-                            } else if (app.clickIsDouble(.node_title, node.id, mp.x, mp.y, nowMs())) {
+                            } else if (app.clickIsDouble(.node_title, node.id, mp.x, mp.y, nowMs()) and !on_img) {
                                 app.doc().selectSingle(node.id);
-                                // 双击：放弃这次拖拽预备，直接进入标题编辑
+                                // 双击：放弃这次拖拽预备，直接进入标题编辑。
+                                // 图片区不参与（双击图片 = 连开两次预览），
+                                // clickIsDouble 仍要调用以刷新点击记录。
                                 app.cmdBeginEditNodeTitle(node);
                             } else {
                                 app.doc().selectSingle(node.id);
@@ -689,7 +741,7 @@ fn drawNodes(app: *app_mod.App, node: *model.Node, rs: dvui.RectScale, with_tags
                                 app.drag_entries.append(app.gpa, .{ .id = node.id, .ox0 = node.geom.ox, .oy0 = node.geom.oy }) catch {};
                                 app.drag_mouse_x = mp.x;
                                 app.drag_mouse_y = mp.y;
-                                app.setStatus("已选中节点，双击可改标题");
+                                app.setStatus(if (on_img) "已选中节点，松手查看图片" else "已选中节点，双击可改标题");
                             }
                         },
                         .motion => {
@@ -812,8 +864,24 @@ fn drawNodes(app: *app_mod.App, node: *model.Node, rs: dvui.RectScale, with_tags
                                         // cmdReparentSelected 消费完 entries 再清
                                         app.drag_entries.clearRetainingCapacity();
                                     }
+                                } else if (app.image_press_id == node.id and !app.drag_snapshot_pushed) {
+                                    // 图片区按下、**没拖动**就松手 = 一次点击 → 打开预览。
+                                    // 拖动过的走下面的「已移动子树」：图片上按下和别处一样
+                                    // 能拖节点，只有「没挪动」才当点击（drag_snapshot_pushed
+                                    // 在第一次真正拖动时才置位）。
+                                    app.image_press_id = 0;
+                                    const cur = rs.pointFromPhysical(me.p);
+                                    const lx = cur.x - (node.geom.x + bw + layout.metrics.pad_x);
+                                    const ly = cur.y - (node.geom.y + bw + layout.metrics.pad_y);
+                                    if (lx >= 0 and ly >= 0 and lx < img_side_e and ly < img_side_e) {
+                                        app.cmdShowImagePreview(node);
+                                    } else {
+                                        // 拖出图片区但没到拖拽阈值（阈内的微小位移）
+                                        app.setStatus("已选中节点");
+                                    }
                                 } else {
                                     app.drag_snapshot_pushed = false; // 下一次拖拽重新压快照
+                                    app.image_press_id = 0; // 拖过了就不算点图片
                                     app.setStatus("已移动子树");
                                 }
                                 dvui.refresh(null, @src(), null);
@@ -1052,8 +1120,9 @@ fn fitEditorRect(visual: dvui.Rect, min_w: f32) dvui.Rect {
     };
 }
 
-/// 输入框直接绑定到 node.text / node.link（array_list backing），
-/// 所见即所得；Enter 或点走确认，Esc 回滚到进入编辑前的文本。
+/// 输入框绑定到 app.edit_draft（草稿缓冲）：node.text/link 已是不可变
+/// ZString，打字先落草稿，Enter / 失焦由 app.cmdCommitEdit 构造新串提交，
+/// Esc 由 cmdCancelEdit 回滚到进入编辑前的文本。
 fn drawInlineEditor(app: *app_mod.App) void {
     if (app.editing == .none) return;
     const node = app.editingNode() orelse {
@@ -1078,18 +1147,14 @@ fn drawInlineEditor(app: *app_mod.App) void {
                 break :blk2 labelBoxAt(pts[edge_samples / 2], "");
             };
             // 标签用 descFont（小字号），输入框用正文字号：宽度按正文重算
-            const ts = dvui.themeGet().font_body.textSize(node.link.items);
+            const ts = dvui.themeGet().font_body.textSize(node.link.slice());
             break :blk fitEditorRect(visual, @max(ts.w + 30, edge_editor_min_w));
         },
         .none => unreachable,
     };
 
     var te = dvui.textEntry(@src(), .{
-        .text = .{ .array_list = .{ .backing = switch (app.editing) {
-            .node_title => &node.text,
-            .edge_title => &node.link,
-            .none => unreachable,
-        }, .allocator = app.gpa } },
+        .text = .{ .array_list = .{ .backing = &app.edit_draft, .allocator = app.gpa } },
         .placeholder = switch (app.editing) {
             .node_title => "节点标题",
             .edge_title => "连线标题",
@@ -1113,7 +1178,7 @@ fn drawInlineEditor(app: *app_mod.App) void {
         // 进入编辑的第一帧：聚焦 + 全选，直接输入即覆盖原文
         app.edit_armed = false;
         dvui.focusWidget(te.data().id, null, null);
-        te.textSet(if (app.editing == .node_title) node.text.items else node.link.items, true);
+        te.textSet(app.edit_draft.items, true);
     }
 
     if (te.text_changed) app.doc().dirty = true;

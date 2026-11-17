@@ -16,8 +16,8 @@ pub const Metrics = struct {
     margin: f32 = 48, // 画布四周留白
     desc_gap: f32 = 4, // 标题与正文描述之间的间距
     desc_font_delta: f32 = -2, // 正文描述相对标题的字号增减（负值 = 略小）
-    img_icon: f32 = 24, // 节点图片图标尺寸（24×24，首行开头）
-    img_gap: f32 = 4, // 图标与标题之间的间距
+    img_min_side: f32 = 128, // 图片区正方形边长下限（128×128；随右列文字撑高）
+    img_gap: f32 = 8, // 图片区与右侧文字列之间的间距
     prop_gap: f32 = 10, // 属性表格与上方文字（标题/描述）之间的间距（约半行）
     prop_row_h: f32 = 18, // 属性表格行高
     prop_name_frac: f32 = 0.4, // 属性名格占内容区宽度比例
@@ -31,6 +31,13 @@ pub fn propNameCellW(content_w: f32) f32 {
     return @min(@max(content_w * metrics.prop_name_frac, metrics.prop_name_min_w), content_w * 0.7);
 }
 
+/// 有图片节点的图片区边长：正方形，下限 img_min_side（128）。
+/// 右列（标题+正文）总高更高时随文字撑高，图片在正方形内保持纵横比缩放。
+/// 测量（measure）与绘制（canvas.drawNodes）必须走同一函数，几何才一致。
+pub fn imgSide(right_h: f32) f32 {
+    return @max(metrics.img_min_side, right_h);
+}
+
 pub const metrics: Metrics = .{};
 
 /// 文本种类：标题用正文字号，正文描述用略小字号。
@@ -42,22 +49,25 @@ pub const TextMeasure = *const fn (ctx: ?*anyopaque, text: []const u8, kind: Tex
 pub const Size = struct { w: f32, h: f32 };
 
 /// 递归测量节点尺寸，写入 geom.w/h。
-/// 有正文描述时高度叠加「间距 + 描述高度」，宽度取标题与描述的较大者。
+/// 有图片时左右两列：左列正方形图片区（最小 img_min_side，随右列总高撑高），
+/// 右列 = 标题 + 正文描述；宽度 = 图片区 + 间距 + 右列最大行宽。
 /// 用户手动尺寸（user_w/user_h）作为下限叠加：实际框取 max(自动, 手动)，
 /// 文字变长仍会自动撑宽，手动拖小到内容以下时自动尺寸兜底。
 pub fn measure(node: *model.Node, ctx: ?*anyopaque, tm: TextMeasure) void {
-    const title = tm(ctx, node.text.items, .title);
-    // 首行：有图片时标题右移（图标 + 间距），行高取标题与图标的较大者
+    const title = tm(ctx, node.text.slice(), .title);
     var w = title.w;
     var h = title.h;
-    if (node.hasImg()) {
-        w += metrics.img_icon + metrics.img_gap;
-        h = @max(h, metrics.img_icon);
-    }
     if (node.hasNote()) {
-        const desc = tm(ctx, node.note.items, .desc);
+        const desc = tm(ctx, node.note.slice(), .desc);
         w = @max(w, desc.w);
         h += metrics.desc_gap + desc.h;
+    }
+    // 图片：左右两列。右列总高（标题 + 间距 + 正文）先算完，作为图片区
+    // 撑高下限；图片区不小于 img_min_side，不小于右列高。
+    if (node.hasImg()) {
+        const img_side = imgSide(h);
+        w = img_side + metrics.img_gap + w;
+        h = @max(img_side, h);
     }
     // 属性表格：先留与上方文字的间距（约半行），再逐行叠加高度
     // （表格宽 = 内容区宽，不撑宽节点）

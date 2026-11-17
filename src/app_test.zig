@@ -15,6 +15,11 @@ const layout = @import("layout.zig");
 const xml = @import("xml.zig");
 const docx_mod = @import("docx.zig");
 const markdown_mod = @import("markdown.zig");
+const zstring = @import("zstring.zig");
+// 拉入 zstring 的单元测试（不可变字符串 / copyOnWrite）
+comptime {
+    _ = @import("zstring.zig");
+}
 
 test "新建 / 切换 / 关闭标签：每个标签是独立文档" {
     var app = try app_mod.App.init(std.testing.allocator, std.testing.io);
@@ -42,6 +47,89 @@ test "新建 / 切换 / 关闭标签：每个标签是独立文档" {
     app.cmdCloseTab(0);
     try std.testing.expectEqual(@as(usize, 1), app.docCount());
     try std.testing.expectEqualStrings("未命名2", app.doc().title(&buf));
+}
+
+test "关闭活动标签前的标签：仍停在原来的活动文档" {
+    var app = try app_mod.App.init(std.testing.allocator, std.testing.io);
+    defer app.deinit();
+    try app.cmdNewDoc(); // 未命名2 @1
+    try app.cmdNewDoc(); // 未命名3 @2
+    app.cmdSelectTab(2);
+
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("未命名3", app.doc().title(&buf));
+
+    // 关掉第 0 个（脏文档会走确认框，需要真实窗口，先置干净）
+    app.docAt(0).dirty = false;
+    app.cmdCloseTab(0);
+
+    // 下标整体前移：活动文档还是「未命名3」，而不是被 min() 夹成「未命名2」
+    try std.testing.expectEqual(@as(usize, 1), app.active);
+    try std.testing.expectEqualStrings("未命名3", app.doc().title(&buf));
+}
+
+test "关闭活动标签会清掉绑在它身上的会话，关别的标签不会" {
+    var app = try app_mod.App.init(std.testing.allocator, std.testing.io);
+    defer app.deinit();
+    try app.cmdNewDoc(); // 未命名2 @1（活动）
+
+    // 在活动文档上开一个取色会话：预备快照指向活动文档的字符串池
+    app.trackColorPicker(1);
+    try std.testing.expect(app.pending_color_snapshot != null);
+
+    // 先关**非活动**标签：会话属于活动文档，必须原样保留
+    app.docAt(0).dirty = false;
+    app.cmdCloseTab(0);
+    try std.testing.expect(app.pending_color_snapshot != null);
+    try std.testing.expectEqual(@as(u32, 1), app.color_session_node_id);
+
+    // 再关活动标签：预备快照/取色状态必须先失效，不能留着指向已释放的池
+    app.doc().dirty = false;
+    app.cmdCloseTab(app.active);
+    try std.testing.expect(app.pending_color_snapshot == null);
+    try std.testing.expectEqual(@as(u32, 0), app.color_session_node_id);
+    try std.testing.expect(app.pending_field_snapshot == null);
+    try std.testing.expectEqual(@as(u64, 0), app.text_focus_id);
+}
+
+test "粘贴节点：解析后紧接着 GC 也不会回收新节点的字符串" {
+    var app = try app_mod.App.init(std.testing.allocator, std.testing.io);
+    defer app.deinit();
+    const d = app.doc();
+
+    // 造「池里攒够垃圾」的局面，让 pasteNodeFragment 里 pushUndo→gcStrings
+    // 这一步真的会跑 GC（门槛 = blocks+trash > 上轮存活×2+64）
+    for (0..200) |i| {
+        var buf: [32]u8 = undefined;
+        _ = try d.strings.create(try std.fmt.bufPrint(&buf, "无主串{d}", .{i}));
+    }
+    try std.testing.expect(d.strings.shouldGc());
+
+    app.pasteNodeFragment(d.root, "<node text=\"粘贴标题\" note=\"粘贴正文\"/>");
+
+    const root = app.doc().root;
+    try std.testing.expect(root.children.items.len > 0);
+    const pasted = root.children.items[root.children.items.len - 1];
+    try std.testing.expectEqualStrings("粘贴标题", pasted.text.slice());
+    try std.testing.expectEqualStrings("粘贴正文", pasted.note.slice());
+
+    // 关键断言：文本块仍在 GC 全集里（被判死只会挪进 trash，下一帧就真 free）。
+    // 若 pushUndo 的 GC 发生在解析之后，这里两个块已经不在 blocks 里了。
+    try std.testing.expect(inPool(&app.doc().strings, pasted.text));
+    try std.testing.expect(inPool(&app.doc().strings, pasted.note));
+
+    // 粘贴失败不该留下空撤销步
+    const undo_before = app.doc().undo_stack.items.len;
+    app.pasteNodeFragment(app.doc().root, "不是节点");
+    try std.testing.expectEqual(undo_before, app.doc().undo_stack.items.len);
+}
+
+/// ZString 的字节块是否还在池的 GC 全集里（诊断用；trash 里 = 已被判死）。
+fn inPool(store: *const zstring.StringStore, z: zstring.ZString) bool {
+    for (store.blocks.items) |b| {
+        if (b.ptr == z.bytes.ptr) return true;
+    }
+    return false;
 }
 
 test "下一个 / 上一个标签到头绕回" {
@@ -122,7 +210,7 @@ test "撤销恢复被删除的整棵子树（文本 / 连线标题 / 正文都�
     app.doc().selectSingle(2); // 示例树里的「分支一」（带正文描述）
     // 示例树连线默认无标题：测试自建一个，验证删除后撤销能整棵恢复
     const n0 = model.find(app.doc().root, 2) orelse return error.NodeMissing;
-    try model.setLink(app.gpa, n0, "测试连线");
+    try model.setLink(&app.doc().strings, n0, "测试连线");
     app.cmdDeleteSelected();
     try std.testing.expectEqual(before - 1, model.countNodes(app.doc().root));
     try std.testing.expect(model.find(app.doc().root, 2) == null);
@@ -130,9 +218,9 @@ test "撤销恢复被删除的整棵子树（文本 / 连线标题 / 正文都�
     app.cmdUndo();
     try std.testing.expectEqual(before, model.countNodes(app.doc().root));
     const n = model.find(app.doc().root, 2) orelse return error.NodeMissing;
-    try std.testing.expectEqualStrings("分支一", n.text.items);
-    try std.testing.expectEqualStrings("带正文描述的节点", n.note.items);
-    try std.testing.expectEqualStrings("测试连线", n.link.items);
+    try std.testing.expectEqualStrings("分支一", n.text.slice());
+    try std.testing.expectEqualStrings("带正文描述的节点", n.note.slice());
+    try std.testing.expectEqualStrings("测试连线", n.link.slice());
 }
 
 test "新的编辑让重做栈作废" {
@@ -279,7 +367,7 @@ test "XML 往返保留背景色；非法颜色值宽容处理" {
     const purple_alpha = model.Rgba{ .r = 0x80, .g = 0x60, .b = 0xc0, .a = 0x80 };
     // 根节点自带示例浅黄背景（buildSampleTree）；再挂一个无色节点验证「无属性往返」
     try std.testing.expectEqual(yellow, app.doc().root.bg.?);
-    _ = try model.addChild(app.gpa, app.doc().root, 4, "无色节点");
+    _ = try model.addChild(&app.doc().strings, app.doc().root, 4, "无色节点");
     const n2 = model.find(app.doc().root, 2) orelse return error.NodeMissing;
     const n3 = model.find(app.doc().root, 3) orelse return error.NodeMissing;
     n2.bg = yellow;
@@ -288,8 +376,9 @@ test "XML 往返保留背景色；非法颜色值宽容处理" {
     const data = try xml.save(app.doc().root, &app.doc().images, app.gpa);
     defer app.gpa.free(data);
 
-    const root2 = try xml.load(app.gpa, data);
-    defer root2.deinit(app.gpa);
+    var res2 = try xml.loadEx(app.gpa, data);
+    defer res2.deinit(app.gpa);
+    const root2 = res2.root;
     const r2 = model.find(root2, 2) orelse return error.NodeMissing;
     const r3 = model.find(root2, 3) orelse return error.NodeMissing;
     try std.testing.expectEqual(yellow, r2.bg.?);
@@ -298,8 +387,9 @@ test "XML 往返保留背景色；非法颜色值宽容处理" {
     try std.testing.expect(r4.bg == null); // 无色节点不写属性，读回 null
 
     // 非法颜色值不报错：退回跟随主题
-    const bad = try xml.load(app.gpa, "<mindmap version=\"1\"><node id=\"1\" text=\"x\" bg=\"nope\"/></mindmap>");
-    defer bad.deinit(app.gpa);
+    var bad_res = try xml.loadEx(app.gpa, "<mindmap version=\"1\"><node id=\"1\" text=\"x\" bg=\"nope\"/></mindmap>");
+    defer bad_res.deinit(app.gpa);
+    const bad = bad_res.root;
     try std.testing.expect(bad.bg == null);
 }
 
@@ -409,8 +499,9 @@ test "XML 往返保留节点手动尺寸；非法值忽略" {
     const data = try xml.save(app.doc().root, &app.doc().images, app.gpa);
     defer app.gpa.free(data);
 
-    const root2 = try xml.load(app.gpa, data);
-    defer root2.deinit(app.gpa);
+    var res2 = try xml.loadEx(app.gpa, data);
+    defer res2.deinit(app.gpa);
+    const root2 = res2.root;
     const r2 = model.find(root2, 2) orelse return error.NodeMissing;
     const r3 = model.find(root2, 3) orelse return error.NodeMissing;
     try std.testing.expectEqual(@as(f32, 300), r2.user_w.?);
@@ -420,8 +511,9 @@ test "XML 往返保留节点手动尺寸；非法值忽略" {
     try std.testing.expect(root2.user_w == null and root2.user_h == null);
 
     // 非法 / 非正值忽略，退回自动布局
-    const bad = try xml.load(app.gpa, "<mindmap version=\"1\"><node id=\"1\" text=\"x\" w=\"abc\" h=\"-5\"/></mindmap>");
-    defer bad.deinit(app.gpa);
+    var bad_res = try xml.loadEx(app.gpa, "<mindmap version=\"1\"><node id=\"1\" text=\"x\" w=\"abc\" h=\"-5\"/></mindmap>");
+    defer bad_res.deinit(app.gpa);
+    const bad = bad_res.root;
     try std.testing.expect(bad.user_w == null and bad.user_h == null);
 }
 
@@ -492,6 +584,136 @@ test "画布拖拽节点右边缘调宽，撤销回退" {
     try std.testing.expect(n2b.user_w == null);
     _ = app.layoutTree();
     try std.testing.expectEqual(start_w, n2b.geom.w);
+}
+
+test "点击节点图片打开全窗口预览，Esc 关闭；点标题不开预览" {
+    // 真 PNG（工程 logo）：假字节会让 stbi 每帧记 error log，build 判失败
+    const test_png = @embedFile("assets/logo64x64.png");
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 800, .h = 800 } });
+    defer t.deinit();
+    var app = try app_mod.App.init(std.testing.allocator, std.testing.io);
+    defer app.deinit();
+    Fns.app_ptr = &app;
+
+    // 给分支一（id 2）设一张图片（真 PNG：假字节会被 stbi 记 error log，
+    // 而 build 的 test 步骤把 error log 算失败）
+    const n2 = model.find(app.doc().root, 2) orelse return error.NodeMissing;
+    try app.cmdSetNodeImg(n2, "png", test_png);
+    try dvui.testing.settle(Fns.frame);
+
+    // 按在图片区（节点内容区左上角，128×128 正方形）上
+    const td = dvui.tagGet("node:2") orelse return error.NoTag;
+    if (!td.visible) return error.NodeNotVisible;
+    const cw = dvui.currentWindow();
+    const press_x = td.rect.x + 12;
+    const press_y = td.rect.y + 12;
+    _ = try cw.addEventMouseMotion(.{ .pt = .{ .x = press_x, .y = press_y } });
+    _ = try cw.addEventMouseButton(.left, .press);
+    try dvui.testing.settle(Fns.frame);
+
+    // 按下只选中、只挂起预览：此刻就弹模态框会吞掉这次点击的 release
+    try std.testing.expect(!keys.anyDialogOpen());
+    try std.testing.expectEqual(@as(u32, 2), app.doc().selected_id.?);
+    try std.testing.expectEqual(@as(u32, 2), app.image_press_id);
+
+    // 松手才打开预览（模态），节点仍是选中态
+    _ = try cw.addEventMouseButton(.left, .release);
+    try dvui.testing.settle(Fns.frame);
+    try std.testing.expect(keys.anyDialogOpen());
+    try std.testing.expectEqual(@as(u32, 0), app.image_press_id);
+    try std.testing.expectEqual(@as(u32, 2), app.doc().selected_id.?);
+
+    // Esc 关闭（对话框绘制在 Window.end，keys.afterWidgets 已让位）
+    try dvui.testing.pressKey(.escape, mod_none);
+    try dvui.testing.settle(Fns.frame);
+    try std.testing.expect(!keys.anyDialogOpen());
+
+    // 图片区按下后拖动 = 正常拖动节点（图片区不屏蔽拖拽），不弹预览
+    const td3 = dvui.tagGet("node:2") orelse return error.NoTag;
+    const n2b = model.find(app.doc().root, 2) orelse return error.NodeMissing;
+    const oy0 = n2b.geom.oy;
+    const s = dvui.currentWindow().natural_scale;
+    _ = try cw.addEventMouseMotion(.{ .pt = .{ .x = td3.rect.x + 12, .y = td3.rect.y + 12 } });
+    _ = try cw.addEventMouseButton(.left, .press);
+    _ = try cw.addEventMouseMotion(.{ .pt = .{ .x = td3.rect.x + 12, .y = td3.rect.y + 12 + 40 * s } });
+    _ = try cw.addEventMouseButton(.left, .release);
+    try dvui.testing.settle(Fns.frame);
+    try std.testing.expect(!keys.anyDialogOpen());
+    try std.testing.expectEqual(@as(u32, 0), app.image_press_id);
+    // 拖动真的生效（下移 40 自然像素；向下不受顶边钳制）
+    try std.testing.expectEqual(oy0 + 40, n2b.geom.oy);
+
+    // 点标题区（右列）：正常选中，不开预览
+    const td2 = dvui.tagGet("node:2") orelse return error.NoTag;
+    _ = try cw.addEventMouseMotion(.{ .pt = .{ .x = td2.rect.x + td2.rect.w - 40, .y = td2.rect.y + 12 } });
+    _ = try cw.addEventMouseButton(.left, .press);
+    _ = try cw.addEventMouseButton(.left, .release);
+    try dvui.testing.settle(Fns.frame);
+    try std.testing.expect(!keys.anyDialogOpen());
+    try std.testing.expectEqual(@as(u32, 0), app.image_press_id);
+}
+
+test "节点图片按纵横比缩放：2:1 的图在正方形图片区里只占一半高" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 800, .h = 800 } });
+    defer t.deinit();
+    var app = try app_mod.App.init(std.testing.allocator, std.testing.io);
+    defer app.deinit();
+    Fns.app_ptr = &app;
+
+    // 8×4 纯蓝 PNG（2:1）。必须是真 PNG：假字节会被 stbi 每帧记 error log，
+    // 而 build 的 test 步骤把 error log 算失败。
+    const wide_png = [_]u8{
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+        0x44, 0x52, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x04, 0x08, 0x02, 0x00, 0x00,
+        0x00, 0x3c, 0xaf, 0xe9, 0xa7, 0x00, 0x00, 0x00, 0x10, 0x49, 0x44, 0x41, 0x54, 0x78,
+        0xda, 0x63, 0x60, 0x60, 0xf8, 0x8f, 0x03, 0x51, 0x4d, 0x02, 0x00, 0x1a, 0x9e, 0x1f,
+        0xe1, 0xe9, 0x2d, 0x23, 0xf4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+        0x42, 0x60, 0x82,
+    };
+
+    const n2 = model.find(app.doc().root, 2) orelse return error.NodeMissing;
+    try app.cmdSetNodeImg(n2, "png", &wide_png);
+    try dvui.testing.settle(Fns.frame);
+
+    var map = try canvas.renderMap(&app, std.testing.allocator);
+    defer map.deinit(std.testing.allocator);
+
+    // 图片是纯蓝：扫出蓝色像素的包围盒 = 图片真实绘制区域
+    var min_x: u32 = map.width;
+    var min_y: u32 = map.height;
+    var max_x: u32 = 0;
+    var max_y: u32 = 0;
+    var found = false;
+    var y: u32 = 0;
+    while (y < map.height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < map.width) : (x += 1) {
+            const p = mapPixel(map, x, y);
+            if (p[3] > 200 and p[2] > 180 and p[0] < 90 and p[1] < 90) {
+                found = true;
+                min_x = @min(min_x, x);
+                max_x = @max(max_x, x);
+                min_y = @min(min_y, y);
+                max_y = @max(max_y, y);
+            }
+        }
+    }
+    try std.testing.expect(found);
+    const drawn_w: f32 = @floatFromInt(max_x - min_x + 1);
+    const drawn_h: f32 = @floatFromInt(max_y - min_y + 1);
+    // 图片区边长：该节点右列文字不高，图片区 = 内容区高度（layout.imgSide 下限 128）
+    const side = @max(n2.geom.h - layout.metrics.pad_y * 2, layout.metrics.img_min_side);
+
+    // 2:1 的图：宽度占满图片区，高度只有一半（拉伸的话这里会是 side×side）
+    try std.testing.expect(@abs(drawn_w - side) <= 2);
+    try std.testing.expect(@abs(drawn_h - side / 2) <= 2);
+
+    // 靠左上对齐：图片左上角落在节点内容区左上角（geom + 边框 1px + padding），
+    // 而不是正方形居中（那样 min_y 会多出 side/4 ≈ 32px 的空白）
+    const content_x = n2.geom.x + 1 + layout.metrics.pad_x;
+    const content_y = n2.geom.y + 1 + layout.metrics.pad_y;
+    try std.testing.expect(@abs(@as(f32, @floatFromInt(min_x)) - content_x) <= 2);
+    try std.testing.expect(@abs(@as(f32, @floatFromInt(min_y)) - content_y) <= 2);
 }
 
 test "侧栏描述输入框：拖动把手调高度，上拖钳到下限" {
@@ -595,6 +817,7 @@ const Fns = struct {
 
     fn frame() !dvui.App.Result {
         const app = app_ptr;
+        app.tickFrame(); // 与 main.guiFrame 一致：推进 GC 的帧序号
         if (show_about) {
             show_about = false;
             app.cmdShowAbout();
@@ -624,36 +847,115 @@ const Fns = struct {
     }
 };
 
-test "复制/粘贴节点：同级新节点、只复制自身（不含子节点）、可撤销" {
+/// 剪贴板命令帧：cmdCopySelected / cmdPasteNode 读写系统剪贴板必须跑在
+/// dvui 帧内（走 dvui 后端）。这个最小帧函数在帧内执行命令，另提供
+/// 剪贴板文本的帧内快照 / 保存恢复——测试会动真实剪贴板，测完还原。
+/// 注意：帧 arena 每帧重置，快照必须在同一帧内拷进固定 buffer；
+/// saved 只 dupe 不释放旧值，跨测试共享时由测试开头置 null。
+const ClipFns = struct {
+    var app_ptr: *app_mod.App = undefined;
+    var action: Action = .none;
+    /// .set_text 要写进剪贴板的文本（下一帧写入）
+    var set_text: []const u8 = "";
+    /// .snap 抓下来的剪贴板文本
+    var snap_buf: [8192]u8 = @splat(0);
+    var snap_len: usize = 0;
+    /// .save 留底的原剪贴板内容（testing allocator 所有，restore 后释放）
+    var saved: ?[]u8 = null;
+
+    const Action = enum { none, copy, paste, paste_twice, snap, save, restore, set_text };
+
+    fn frame() !dvui.App.Result {
+        const app = app_ptr;
+        switch (action) {
+            .none => {},
+            .copy => {
+                action = .none;
+                app.cmdCopySelected();
+            },
+            .paste => {
+                action = .none;
+                app.cmdPasteNode();
+            },
+            .paste_twice => {
+                action = .none;
+                app.cmdPasteNode();
+                app.cmdPasteNode();
+            },
+            .snap => {
+                action = .none;
+                const t = dvui.clipboardText();
+                snap_len = @min(t.len, snap_buf.len);
+                @memcpy(snap_buf[0..snap_len], t[0..snap_len]);
+            },
+            .save => {
+                action = .none;
+                saved = try std.testing.allocator.dupe(u8, dvui.clipboardText());
+            },
+            .restore => {
+                action = .none;
+                if (saved) |s| {
+                    dvui.clipboardTextSet(s);
+                    std.testing.allocator.free(s);
+                    saved = null;
+                }
+            },
+            .set_text => {
+                action = .none;
+                dvui.clipboardTextSet(set_text);
+            },
+        }
+        return .ok;
+    }
+
+    fn clipText() []const u8 {
+        return snap_buf[0..snap_len];
+    }
+};
+
+test "复制/粘贴节点：系统剪贴板 <node> 文本、同级新节点、可撤销" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
     var app = try app_mod.App.init(std.testing.allocator, std.testing.io);
     defer app.deinit();
+    ClipFns.app_ptr = &app;
+    ClipFns.saved = null;
+    ClipFns.action = .save;
+    _ = try dvui.testing.step(ClipFns.frame); // 留底真实剪贴板，测试结束还原
 
-    // 分支一（id 2）：加一个子节点 + 属性，验证粘贴时不带子节点、内容照搬
+    // 分支一（id 2）：加一个子节点 + 属性 + 图片，验证粘贴时不带子节点、内容照搬
     const n2 = model.find(app.doc().root, 2) orelse return error.NodeMissing;
-    const child = try model.addChild(app.gpa, n2, 5, "子节点");
+    const child = try model.addChild(&app.doc().strings, n2, 5, "子节点");
     child.parent = n2;
     try model.addProperty(app.gpa, n2, "权重", "1");
-    try model.setImgRef(app.gpa, n2, "ref-x");
+    const img_id = try app.doc().images.ensure(app.gpa, "png", "fake-png-bytes");
+    try model.setImgRef(app.gpa, n2, img_id);
+    app.doc().next_id = 6; // 手动建的子节点占了 5，粘贴从 6 起分配 id
 
     app.doc().selectSingle(2);
-    app.cmdCopySelected();
-    try std.testing.expect(app.clipboard != null);
+    ClipFns.action = .copy;
+    _ = try dvui.testing.step(ClipFns.frame);
+    ClipFns.action = .snap;
+    _ = try dvui.testing.step(ClipFns.frame);
+    // 剪贴板里是节点序列化文本
+    try std.testing.expect(std.mem.startsWith(u8, ClipFns.clipText(), "<node"));
 
     const before_len = app.doc().root.children.items.len;
-    app.cmdPasteNode();
+    ClipFns.action = .paste;
+    _ = try dvui.testing.step(ClipFns.frame);
     try std.testing.expectEqual(before_len + 1, app.doc().root.children.items.len);
 
-    // 新节点：父节点与原节点相同（行内同级），紧跟在原节点之后
+    // 新节点：父节点与原节点相同（同级），紧跟在原节点之后，id 重新分配
     const kids = app.doc().root.children.items;
     const src_idx = std.mem.indexOfScalar(*model.Node, kids, model.find(app.doc().root, 2).?).?;
     const pasted = kids[src_idx + 1];
-    try std.testing.expect(pasted.id != 2);
+    try std.testing.expectEqual(@as(u32, 6), pasted.id);
     try std.testing.expect(pasted.parent == app.doc().root);
-    // 内容照搬（标题/描述/属性/图片引用），但**不带子节点**
+    // 内容照搬（标题/描述/属性/图片引用），但**不带子节点**；图片回到池里同一资源
     const src = model.find(app.doc().root, 2).?;
-    try std.testing.expectEqualStrings(src.text.items, pasted.text.items);
-    try std.testing.expectEqualStrings(src.note.items, pasted.note.items);
-    try std.testing.expectEqualStrings("ref-x", pasted.img_ref.items);
+    try std.testing.expectEqualStrings(src.text.slice(), pasted.text.slice());
+    try std.testing.expectEqualStrings(src.note.slice(), pasted.note.slice());
+    try std.testing.expectEqualStrings(src.img_ref.items, pasted.img_ref.items);
     try std.testing.expectEqual(@as(usize, 1), pasted.properties.items.len);
     try std.testing.expectEqualStrings("权重", pasted.properties.items[0].name.items);
     try std.testing.expectEqual(@as(usize, 0), pasted.children.items.len);
@@ -667,22 +969,42 @@ test "复制/粘贴节点：同级新节点、只复制自身（不含子节点�
     try std.testing.expectEqual(@as(usize, 1), still.children.items.len);
 
     // 剪贴板可重复使用：连续粘贴两次得到两个节点
-    app.cmdPasteNode();
-    app.cmdPasteNode();
+    ClipFns.action = .paste_twice;
+    _ = try dvui.testing.step(ClipFns.frame);
     try std.testing.expectEqual(before_len + 2, app.doc().root.children.items.len);
+
+    ClipFns.action = .restore;
+    _ = try dvui.testing.step(ClipFns.frame);
 }
 
 test "剪贴板为空 / 未选中节点时的提示，不产生节点" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
     var app = try app_mod.App.init(std.testing.allocator, std.testing.io);
     defer app.deinit();
+    ClipFns.app_ptr = &app;
+    ClipFns.saved = null;
+    ClipFns.action = .save;
+    _ = try dvui.testing.step(ClipFns.frame); // 留底真实剪贴板，测试结束还原
 
     const before_len = app.doc().root.children.items.len;
-    app.cmdPasteNode(); // 空剪贴板
+    app.doc().selectionClear();
+    ClipFns.action = .paste; // 未选中：粘贴只提示，不产生节点
+    _ = try dvui.testing.step(ClipFns.frame);
     try std.testing.expectEqual(before_len, app.doc().root.children.items.len);
 
-    app.doc().selectionClear();
-    app.cmdCopySelected(); // 没选中
-    try std.testing.expect(app.clipboard == null);
+    // 先写一个已知标记：未选中时复制不得改动剪贴板（标记原样保留）
+    ClipFns.set_text = "zmind-clipboard-marker";
+    ClipFns.action = .set_text;
+    _ = try dvui.testing.step(ClipFns.frame);
+    ClipFns.action = .copy; // 未选中：复制不写剪贴板
+    _ = try dvui.testing.step(ClipFns.frame);
+    ClipFns.action = .snap;
+    _ = try dvui.testing.step(ClipFns.frame);
+    try std.testing.expectEqualStrings("zmind-clipboard-marker", ClipFns.clipText());
+
+    ClipFns.action = .restore;
+    _ = try dvui.testing.step(ClipFns.frame);
 }
 
 test "Ctrl+C / Ctrl+V 按键走真实帧生效" {
@@ -691,12 +1013,18 @@ test "Ctrl+C / Ctrl+V 按键走真实帧生效" {
     var app = try app_mod.App.init(std.testing.allocator, std.testing.io);
     defer app.deinit();
     Fns.app_ptr = &app;
+    ClipFns.app_ptr = &app;
+    ClipFns.saved = null;
+    ClipFns.action = .save;
+    _ = try dvui.testing.step(ClipFns.frame); // 留底真实剪贴板，测试结束还原
     app.doc().selectSingle(3); // 分支二（叶子）
     try dvui.testing.settle(Fns.frame);
 
     try dvui.testing.pressKey(.c, mod_ctrl);
     try dvui.testing.settle(Fns.frame);
-    try std.testing.expect(app.clipboard != null);
+    ClipFns.action = .snap;
+    _ = try dvui.testing.step(ClipFns.frame);
+    try std.testing.expect(std.mem.startsWith(u8, ClipFns.clipText(), "<node"));
 
     const before_len = app.doc().root.children.items.len;
     try dvui.testing.pressKey(.v, mod_ctrl);
@@ -705,7 +1033,35 @@ test "Ctrl+C / Ctrl+V 按键走真实帧生效" {
     // 粘贴出来的节点与源同级（挂在根下），标题相同
     const pasted = model.find(app.doc().root, app.doc().selected_id.?) orelse return error.NodeMissing;
     try std.testing.expect(pasted.parent == app.doc().root);
-    try std.testing.expectEqualStrings("分支二", pasted.text.items);
+    try std.testing.expectEqualStrings("分支二", pasted.text.slice());
+
+    ClipFns.action = .restore;
+    _ = try dvui.testing.step(ClipFns.frame);
+}
+
+test "Ctrl+V 普通文本粘贴为节点标题" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    var app = try app_mod.App.init(std.testing.allocator, std.testing.io);
+    defer app.deinit();
+    ClipFns.app_ptr = &app;
+
+    const before_len = app.doc().root.children.items.len;
+    app.doc().selectSingle(2);
+    ClipFns.set_text = "剪贴板文本标题";
+    ClipFns.action = .set_text;
+    _ = try dvui.testing.step(ClipFns.frame);
+    ClipFns.action = .paste;
+    _ = try dvui.testing.step(ClipFns.frame);
+
+    const n2 = model.find(app.doc().root, 2) orelse return error.NodeMissing;
+    try std.testing.expectEqualStrings("剪贴板文本标题", n2.text.slice());
+    try std.testing.expectEqual(before_len, app.doc().root.children.items.len); // 不新增节点
+
+    // 可撤销：标题回原样（undo 整树重建，要重新 find）
+    app.cmdUndo();
+    const n2b = model.find(app.doc().root, 2) orelse return error.NodeMissing;
+    try std.testing.expectEqualStrings("分支一", n2b.text.slice());
 }
 
 const mod_none: dvui.enums.Mod = @fromBackingInt(@intCast(0));
@@ -737,12 +1093,11 @@ test "缺陷 3：多行文本测量按行累加，布局与画布走同一算法
 
     // 带多行正文的节点：geom 高度必须容得下 标题 + 间距 + 多行正文 + 上下内边距
     const n = model.find(app.doc().root, 2) orelse return error.NodeMissing;
-    n.note.clearRetainingCapacity();
-    try n.note.appendSlice(app.gpa, "第一行正文\n第二行正文");
+    try model.setNote(&app.doc().strings, n, "第一行正文\n第二行正文");
     _ = app.layoutTree();
-    const need = app_mod.App.measureMultiline(dvui.themeGet().font_body, n.text.items).h +
+    const need = app_mod.App.measureMultiline(dvui.themeGet().font_body, n.text.slice()).h +
         layout.metrics.desc_gap +
-        app_mod.App.measureMultiline(app_mod.App.descFont(), n.note.items).h +
+        app_mod.App.measureMultiline(app_mod.App.descFont(), n.note.slice()).h +
         layout.metrics.pad_y * 2;
     try std.testing.expect(n.geom.h >= need - 1);
 }
@@ -861,11 +1216,13 @@ test "菜单：文件 → 导出 → 导出为 Markdown 挂号 FileAction.export
 
 test "docx 导出：层级≤5 按标题、更深为正文，note 跟在其后" {
     const alloc = std.testing.allocator;
+    var strings = zstring.StringStore.init(alloc);
+    defer strings.deinit();
 
     // document.xml 必须是完整 OOXML 文档（<w:document> 根元素包住段落）：
     // 缺了这层包装 Word 解析失败，导出的文档显示为空（回归：内容丢失）
     {
-        const single = try model.createNode(alloc, 1, "根");
+        const single = try model.createNode(&strings, 1, "根");
         defer single.deinit(alloc);
         const data = try docx_mod.buildDocx(alloc, single);
         defer alloc.free(data);
@@ -881,18 +1238,18 @@ test "docx 导出：层级≤5 按标题、更深为正文，note 跟在其后" 
 
     // 中心(层1) → 一级A(2) → 二级A1(3) → 三级A1a(4) → 四级A1a1(5, 最后一个标题层)
     // → 五级正文(6, 第一个正文层)；根与一级A 各带 note
-    const root = try model.createNode(alloc, 1, "中心主题");
+    const root = try model.createNode(&strings, 1, "中心主题");
     defer root.deinit(alloc);
-    try model.setNote(alloc, root, "根节点描述");
+    try model.setNote(&strings, root, "根节点描述");
 
     var parent = root;
     var id: u32 = 2;
     const names = [_][]const u8{ "一级A", "二级A1", "三级A1a", "四级A1a1" };
     for (names) |nm| {
-        parent = try model.addChild(alloc, parent, id, nm);
+        parent = try model.addChild(&strings, parent, id, nm);
         id += 1;
     }
-    _ = try model.addChild(alloc, parent, id, "五级正文节点");
+    _ = try model.addChild(&strings, parent, id, "五级正文节点");
 
     const data = try docx_mod.buildDocx(alloc, root);
     defer alloc.free(data);
@@ -916,20 +1273,22 @@ test "docx 导出：层级≤5 按标题、更深为正文，note 跟在其后" 
 
 test "Markdown 导出：层级≤5 按层级标题、更深为正文，note 跟在其后" {
     const alloc = std.testing.allocator;
+    var strings = zstring.StringStore.init(alloc);
+    defer strings.deinit();
 
     // 与 docx 层级测试同构的树：五级为最后一个标题层，第六层为正文
-    const root = try model.createNode(alloc, 1, "中心主题");
+    const root = try model.createNode(&strings, 1, "中心主题");
     defer root.deinit(alloc);
-    try model.setNote(alloc, root, "根节点描述");
+    try model.setNote(&strings, root, "根节点描述");
 
     var parent = root;
     var id: u32 = 2;
     const names = [_][]const u8{ "一级A", "二级A1", "三级A1a", "四级A1a1" };
     for (names) |nm| {
-        parent = try model.addChild(alloc, parent, id, nm);
+        parent = try model.addChild(&strings, parent, id, nm);
         id += 1;
     }
-    _ = try model.addChild(alloc, parent, id, "五级正文节点");
+    _ = try model.addChild(&strings, parent, id, "五级正文节点");
 
     const md = try markdown_mod.buildMarkdown(alloc, root);
     defer alloc.free(md);
@@ -950,15 +1309,17 @@ test "Markdown 导出：层级≤5 按层级标题、更深为正文，note 跟�
 
 test "文档导出：子节点按 seq*10_000_000+id 升序（seq 缺省 0），树本身不动" {
     const alloc = std.testing.allocator;
+    var strings = zstring.StringStore.init(alloc);
+    defer strings.deinit();
 
     // 插入顺序 丙(30,seq2) 甲(10,seq2) 乙(20,seq5) 丁(40,无seq)。
     // 排序键：丁=40 < 甲=20_000_010 < 丙=20_000_030 < 乙=50_000_020
-    const root = try model.createNode(alloc, 1, "根");
+    const root = try model.createNode(&strings, 1, "根");
     defer root.deinit(alloc);
-    const c = try model.addChild(alloc, root, 30, "丙");
-    const a = try model.addChild(alloc, root, 10, "甲");
-    const b = try model.addChild(alloc, root, 20, "乙");
-    _ = try model.addChild(alloc, root, 40, "丁");
+    const c = try model.addChild(&strings, root, 30, "丙");
+    const a = try model.addChild(&strings, root, 10, "甲");
+    const b = try model.addChild(&strings, root, 20, "乙");
+    _ = try model.addChild(&strings, root, 40, "丁");
     c.seq = 2;
     a.seq = 2;
     b.seq = 5;
@@ -986,12 +1347,14 @@ test "文档导出：子节点按 seq*10_000_000+id 升序（seq 缺省 0），�
 
 test "XML：seq 属性往返持久化，缺省读回 0" {
     const alloc = std.testing.allocator;
+    var strings = zstring.StringStore.init(alloc);
+    defer strings.deinit();
 
-    const root = try model.createNode(alloc, 1, "根");
+    const root = try model.createNode(&strings, 1, "根");
     defer root.deinit(alloc);
-    const a = try model.addChild(alloc, root, 2, "甲");
+    const a = try model.addChild(&strings, root, 2, "甲");
     a.seq = 42;
-    _ = try model.addChild(alloc, root, 3, "乙"); // 无 seq → 不写属性 → 读回 0
+    _ = try model.addChild(&strings, root, 3, "乙"); // 无 seq → 不写属性 → 读回 0
 
     var images: model.ImageStore = .{};
     defer images.deinit(alloc);
@@ -1003,19 +1366,66 @@ test "XML：seq 属性往返持久化，缺省读回 0" {
     const yi_text = std.mem.indexOfPos(u8, data, yi_open, "text=").?;
     try std.testing.expect(std.mem.indexOf(u8, data[yi_open..yi_text], "seq") == null);
 
-    const back = try xml.load(alloc, data);
-    defer back.deinit(alloc);
+    var back_res = try xml.loadEx(alloc, data);
+    defer back_res.deinit(alloc);
+    const back = back_res.root;
     try std.testing.expectEqual(@as(u32, 1), back.id);
     try std.testing.expectEqual(@as(u64, 42), back.children.items[0].seq);
     try std.testing.expectEqual(@as(u64, 0), back.children.items[1].seq);
 }
 
+test "节点片段序列化 roundtrip：不含子节点、图片内联、跨池还原引用" {
+    const alloc = std.testing.allocator;
+    var strings = zstring.StringStore.init(alloc);
+    defer strings.deinit();
+
+    const root = try model.createNode(&strings, 1, "根");
+    defer root.deinit(alloc);
+    const n2 = try model.addChild(&strings, root, 2, "分支一");
+    try model.setNote(&strings, n2, "描述");
+    _ = try model.addChild(&strings, n2, 3, "子节点");
+    try model.addProperty(alloc, n2, "权重", "1");
+    var images: model.ImageStore = .{};
+    defer images.deinit(alloc);
+    const img_id = try images.ensure(alloc, "png", "png-bytes-0");
+    try model.setImgRef(alloc, n2, img_id);
+
+    // 序列化（剪贴板格式）：只含节点自身，图片内联 base64
+    const text = try xml.serializeNodeFragment(alloc, n2, &images);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "<node"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "</node>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "<img type=\"png\">") != null); // 内联
+    try std.testing.expect(std.mem.indexOf(u8, text, "img ref=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "子节点") == null); // 不含子节点
+
+    // 粘贴端：解析进另一个（新）图片池 → 内联图转为池资源，节点拿到引用；
+    // 文本字节写入同一个字符串池
+    var pool2: model.ImageStore = .{};
+    defer pool2.deinit(alloc);
+    const pasted = try xml.parseNodeFragment(alloc, text, &pool2, &strings);
+    defer pasted.deinit(alloc);
+    try std.testing.expectEqualStrings(n2.text.slice(), pasted.text.slice());
+    try std.testing.expectEqualStrings(n2.note.slice(), pasted.note.slice());
+    try std.testing.expectEqual(@as(usize, 1), pasted.properties.items.len);
+    try std.testing.expectEqual(@as(usize, 0), pasted.children.items.len);
+    try std.testing.expect(pasted.hasImg());
+    const asset = pool2.findById(pasted.img_ref.items) orelse return error.ImageMissing;
+    try std.testing.expectEqualStrings("png", asset.img_type.items);
+    try std.testing.expectEqualStrings("png-bytes-0", asset.data.items);
+
+    // 坏片段：不 panic，返回 MalformedXml
+    try std.testing.expectError(error.MalformedXml, xml.parseNodeFragment(alloc, "<node", &pool2, &strings));
+}
+
 test "docx 导出：XML 转义与非法控制字符过滤" {
     const alloc = std.testing.allocator;
+    var strings = zstring.StringStore.init(alloc);
+    defer strings.deinit();
 
-    const root = try model.createNode(alloc, 1, "a<b>&\"'z");
+    const root = try model.createNode(&strings, 1, "a<b>&\"'z");
     defer root.deinit(alloc);
-    try model.setNote(alloc, root, "含\x01控制符\x02的文本");
+    try model.setNote(&strings, root, "含\x01控制符\x02的文本");
 
     const data = try docx_mod.buildDocx(alloc, root);
     defer alloc.free(data);
@@ -1037,17 +1447,19 @@ test "缺陷 1：内联编辑中按 Esc 取消编辑并回滚文本" {
     try dvui.testing.settle(Fns.frame);
     try std.testing.expect(app.editing == .node_title);
 
-    // 进入编辑即全选：直接输入覆盖原文（sanity：文本确实进了内联输入框）
+    // 进入编辑即全选：直接输入覆盖原文。文本先落草稿缓冲，节点文本此刻不变
+    //（COW：提交前节点的 ZString 一字不动）
     try dvui.testing.writeText("改过的标题");
     try dvui.testing.settle(Fns.frame);
-    try std.testing.expectEqualStrings("改过的标题", n.text.items);
+    try std.testing.expectEqualStrings("改过的标题", app.edit_draft.items);
+    try std.testing.expectEqualStrings("分支一", n.text.slice());
 
     // Esc 必须被帧首的全局分发接住——等控件画完，TextEntry 已把没消费的
     // 按键标记 handled，帧末循环就收不到（report 缺陷 1）
     try dvui.testing.pressKey(.escape, mod_none);
     try dvui.testing.settle(Fns.frame);
     try std.testing.expect(app.editing == .none);
-    try std.testing.expectEqualStrings("分支一", n.text.items);
+    try std.testing.expectEqualStrings("分支一", n.text.slice()); // 草稿作废，整体回滚
 }
 
 test "缺陷 2：模态对话框打开期间按键不泄漏成快捷键" {
@@ -1128,7 +1540,7 @@ test "缺陷 6：焦点在侧栏标题输入框时裸 Insert 仍插入子节点"
     try std.testing.expectEqual(count + 1, model.countNodes(app.doc().root));
     try std.testing.expect(next_id != app.doc().next_id);
     // Insert 不是文本：输入框内容与编辑状态都不该被动过
-    try std.testing.expectEqualStrings("分支一", n.text.items);
+    try std.testing.expectEqualStrings("分支一", n.text.slice());
     try std.testing.expect(app.editing == .none);
 }
 
@@ -1141,7 +1553,7 @@ test "缺陷 5a：编辑中点击内联框，输入只进文本（节点不再�
     try dvui.testing.settle(Fns.frame);
 
     const n = model.find(app.doc().root, 2) orelse return error.NodeMissing;
-    const orig_len = n.text.items.len;
+    const orig_len = n.text.slice().len;
     const count = model.countNodes(app.doc().root);
     app.doc().selectSingle(2); // 选中它再进编辑，验证点击不会把选中项带跑
     app.cmdBeginEditNodeTitle(n);
@@ -1160,9 +1572,10 @@ test "缺陷 5a：编辑中点击内联框，输入只进文本（节点不再�
     try dvui.testing.settle(Fns.frame);
 
     // 只是插入一个字符：既没整段替换（= 光标落点被全选覆盖），
-    // 也没误触发加/删节点或切标签
-    try std.testing.expectEqual(orig_len + 1, n.text.items.len);
-    try std.testing.expect(!std.mem.eql(u8, n.text.items, "X"));
+    // 也没误触发加/删节点或切标签。COW：插入只落草稿，节点文本一字未动
+    try std.testing.expectEqual(orig_len + 1, app.edit_draft.items.len);
+    try std.testing.expect(!std.mem.eql(u8, app.edit_draft.items, "X"));
+    try std.testing.expectEqual(orig_len, n.text.slice().len);
     try std.testing.expect(app.editing == .node_title);
     try std.testing.expectEqual(@as(u32, 2), app.editing_id);
     try std.testing.expectEqual(@as(?u32, 2), app.doc().selected_id);
@@ -1188,7 +1601,9 @@ test "缺陷 5b：全选后按左箭头收缩选区，输入插到开头" {
     try dvui.testing.writeText("X");
     try dvui.testing.settle(Fns.frame);
 
-    try std.testing.expectEqualStrings("X分支一", n.text.items);
+    // 输入插到开头：草稿内容如此，节点文本在提交前不变（COW）
+    try std.testing.expectEqualStrings("X分支一", app.edit_draft.items);
+    try std.testing.expectEqualStrings("分支一", n.text.slice());
 }
 
 test "缺陷 5b：全选后按右箭头收缩选区，输入插到末尾" {
@@ -1209,7 +1624,9 @@ test "缺陷 5b：全选后按右箭头收缩选区，输入插到末尾" {
     try dvui.testing.writeText("X");
     try dvui.testing.settle(Fns.frame);
 
-    try std.testing.expectEqualStrings("分支一X", n.text.items);
+    // 输入插到末尾：草稿内容如此，节点文本在提交前不变（COW）
+    try std.testing.expectEqualStrings("分支一X", app.edit_draft.items);
+    try std.testing.expectEqualStrings("分支一", n.text.slice());
 }
 
 // ---------------------------------------------------------------------------
@@ -1537,7 +1954,7 @@ test "重挂父：把节点挂到目标节点下，撤销还原父子关系" {
     defer app.deinit();
 
     // 示例树：1(根) → 2(分支一), 3(分支二)；给 2 挂个子节点 4
-    _ = try model.addChild(app.gpa, model.find(app.doc().root, 2) orelse return error.NodeMissing, 4, "孙节点");
+    _ = try model.addChild(&app.doc().strings, model.find(app.doc().root, 2) orelse return error.NodeMissing, 4, "孙节点");
     const before = model.countNodes(app.doc().root);
 
     // 把 3（分支二）重挂到 2（分支一）下
@@ -1562,7 +1979,7 @@ test "重挂父：目标是自身/后代/现父 → 全部跳过并弹回原位�
     var app = try app_mod.App.init(std.testing.allocator, std.testing.io);
     defer app.deinit();
 
-    _ = try model.addChild(app.gpa, model.find(app.doc().root, 2) orelse return error.NodeMissing, 4, "孙节点");
+    _ = try model.addChild(&app.doc().strings, model.find(app.doc().root, 2) orelse return error.NodeMissing, 4, "孙节点");
     const n3 = model.find(app.doc().root, 3) orelse return error.NodeMissing;
     app.doc().selectSingle(3);
     // 模拟拖拽中已经挪动了偏移
@@ -1596,7 +2013,7 @@ test "重挂父：多选两个节点一次挂到新父下，一步撤销全还�
     defer app.deinit();
 
     // 新建节点 4 当落点目标
-    _ = try model.addChild(app.gpa, app.doc().root, 4, "目标节点");
+    _ = try model.addChild(&app.doc().strings, app.doc().root, 4, "目标节点");
     const before = model.countNodes(app.doc().root);
 
     // 多选 2 和 3，一起拖到 4 下
@@ -1705,9 +2122,11 @@ test "多选删除：一次删两个节点，一步撤销整组还原" {
 
 test "XML：保存 left/top 与 position 标记，loadEx 读回" {
     const alloc = std.testing.allocator;
-    const root = try model.createNode(alloc, 1, "根");
+    var strings = zstring.StringStore.init(alloc);
+    defer strings.deinit();
+    const root = try model.createNode(&strings, 1, "根");
     defer root.deinit(alloc);
-    _ = try model.addChild(alloc, root, 2, "甲");
+    _ = try model.addChild(&strings, root, 2, "甲");
     // 模拟排版后的位置（保存的是四舍五入后的整数）
     root.geom.x = 123.4;
     root.geom.y = 55.6;
@@ -1879,7 +2298,7 @@ test "正文描述输入框：侧栏输入框宽度不超过最大宽度" {
     app.doc().selectSingle(2);
     const n = model.find(app.doc().root, 2) orelse return error.NodeMissing;
     // 远超最大宽度的长行（600 字节）
-    try model.setNote(app.gpa, n, "ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab");
+    try model.setNote(&app.doc().strings, n, "ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab");
 
     try dvui.testing.settle(Fns.frame);
 
@@ -1954,7 +2373,7 @@ test "下一级节点列表：拖动换位写 seq=下标，导出顺序跟随，
     defer app.deinit();
 
     // 示例树根下加第三个子节点 4：children 顺序 [2,3,4]，seq 全 0
-    _ = try model.addChild(app.gpa, app.doc().root, 4, "分支三");
+    _ = try model.addChild(&app.doc().strings, app.doc().root, 4, "分支三");
     const parent = app.doc().root;
     const kids = try model.childrenForExport(app.gpa, parent);
     defer app.gpa.free(kids);
@@ -1999,7 +2418,7 @@ test "下一级节点列表：无头拖拽列表项，seq 实时更新" {
     defer app.deinit();
     Fns.app_ptr = &app;
 
-    _ = try model.addChild(app.gpa, app.doc().root, 4, "分支三");
+    _ = try model.addChild(&app.doc().strings, app.doc().root, 4, "分支三");
     app.doc().selectSingle(1);
     try dvui.testing.settle(Fns.frame);
 
@@ -2071,7 +2490,7 @@ test "回归：shift 多选与重挂父（真实事件流）不崩溃" {
     }
 
     // ---- 多选重挂：多选 {2,3}，一起拖到未选中的节点 4 上 ----
-    _ = try model.addChild(app.gpa, app.doc().root, 4, "分支三");
+    _ = try model.addChild(&app.doc().strings, app.doc().root, 4, "分支三");
     app.doc().selectSingle(2);
     {
         const r3 = dvui.tagGet("node:3") orelse return error.TestUnexpectedResult;
@@ -2184,10 +2603,11 @@ test "XML version=2：images 池 + node 内 img ref 往返持久化" {
     try std.testing.expectEqualStrings("jpg", asset.img_type.items);
     try std.testing.expectEqualStrings(img_bytes, asset.data.items);
     try std.testing.expectEqual(@as(usize, 1), res.images.count());
-    // id 就是内容 md5；md5 属性与 id 一致
+    // id 为 uuid；md5 与内容一致，与 id 不同
     var hexbuf: [32]u8 = undefined;
-    try std.testing.expectEqualStrings(model.md5Hex(img_bytes, &hexbuf), asset.id.items);
-    try std.testing.expectEqualStrings(asset.id.items, asset.md5.items);
+    try std.testing.expectEqualStrings(model.md5Hex(img_bytes, &hexbuf), asset.md5.items);
+    try std.testing.expectEqual(@as(usize, 8), asset.id.items.len);
+    try std.testing.expect(!std.mem.eql(u8, asset.id.items, asset.md5.items));
     try std.testing.expectEqual(@as(usize, 2), r2.properties.items.len);
     try std.testing.expectEqualStrings("权重", r2.properties.items[0].name.items);
     try std.testing.expectEqualStrings("1", r2.properties.items[0].value.items);
@@ -2195,8 +2615,9 @@ test "XML version=2：images 池 + node 内 img ref 往返持久化" {
     try std.testing.expectEqualStrings("橡胶<&\"", r2.properties.items[1].value.items);
 
     // version=1 旧文件照常加载（无 images/img/property 天然兼容）
-    var old = try xml.load(app.gpa, "<mindmap version=\"1\"><node id=\"1\" text=\"旧\"/></mindmap>");
-    defer old.deinit(app.gpa);
+    var old_res = try xml.loadEx(app.gpa, "<mindmap version=\"1\"><node id=\"1\" text=\"旧\"/></mindmap>");
+    defer old_res.deinit(app.gpa);
+    const old = old_res.root;
     try std.testing.expect(!old.hasImg());
     try std.testing.expectEqual(@as(usize, 0), old.properties.items.len);
 
@@ -2376,9 +2797,9 @@ test "布局：img 首行撑高、property 逐行叠加高度" {
     const base_h = n3.geom.h;
     const base_w = n3.geom.w;
     // 无属性时高度可能被 node_min_h 撑起，期望值必须按内容高度算（排除钳制）
-    var content_h = app_mod.App.measureMultiline(dvui.themeGet().font_body, n3.text.items).h;
+    var content_h = app_mod.App.measureMultiline(dvui.themeGet().font_body, n3.text.slice()).h;
     if (n3.hasNote()) {
-        content_h += layout.metrics.desc_gap + app_mod.App.measureMultiline(app_mod.App.descFont(), n3.note.items).h;
+        content_h += layout.metrics.desc_gap + app_mod.App.measureMultiline(app_mod.App.descFont(), n3.note.slice()).h;
     }
 
     // 加 2 条属性：内容高度 + 与上方文字的半行间距 + 2×18，宽度不被表格撑动
@@ -2392,13 +2813,14 @@ test "布局：img 首行撑高、property 逐行叠加高度" {
     try std.testing.expectEqual(base_w, n3.geom.w);
     try std.testing.expect(base_h <= n3.geom.h);
 
-    // 加图片：首行高度 ≥ 图标 24（无图时标题行可能小于 24）
+    // 加图片：左右两列布局——左列正方形图片区（最小 img_min_side），
+    // 高度与宽度都被图片区撑起
     model.removeProperty(app.gpa, n3, 1);
     model.removeProperty(app.gpa, n3, 0);
     try app.cmdSetNodeImg(n3, "jpg", "fake-jpeg-bytes");
     _ = app.layoutTree();
-    try std.testing.expect(n3.geom.h >= layout.metrics.img_icon + layout.metrics.pad_y * 2);
-    try std.testing.expect(n3.geom.w >= layout.metrics.img_icon + layout.metrics.img_gap + layout.metrics.pad_x * 2);
+    try std.testing.expect(n3.geom.h >= layout.metrics.img_min_side + layout.metrics.pad_y * 2);
+    try std.testing.expect(n3.geom.w >= layout.metrics.img_min_side + layout.metrics.img_gap + layout.metrics.pad_x * 2);
 }
 
 test "导出渲染：属性表格画在节点框内，名格与值格同一行并排" {
@@ -2409,7 +2831,10 @@ test "导出渲染：属性表格画在节点框内，名格与值格同一行�
 
     const n3 = model.find(app.doc().root, 3) orelse return error.NodeMissing;
     // 撑宽节点：值格才有足够宽度，取样避开左对齐文字
-    try n3.text.appendSlice(app.gpa, " 留足取样宽度");
+    // （ZString 不可原地追加：拼好新标题再整体替换）
+    const wider = try std.fmt.allocPrint(app.gpa, "{s} 留足取样宽度", .{n3.text.slice()});
+    defer app.gpa.free(wider);
+    try model.setText(&app.doc().strings, n3, wider);
     try model.addProperty(app.gpa, n3, "权重", "1");
     _ = app.layoutTree();
     // renderMap 注册 widget id：两次离屏渲染必须隔帧，否则同帧撞 id（dvui 报 duplicate id）

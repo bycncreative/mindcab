@@ -31,14 +31,14 @@ fn walkBody(alloc: Allocator, w: *std.Io.Writer, node: *model.Node, depth: u32) 
     if (depth <= max_heading_level) {
         try w.splatByteAll('#', depth);
         try w.writeByte(' ');
-        try w.writeAll(node.text.items);
+        try w.writeAll(node.text.slice());
         try w.writeAll("\n\n");
     } else {
-        try writeParagraph(w, node.text.items);
+        try writeParagraph(w, node.text.slice());
     }
     // note（正文描述）跟在其后；按行拆成多段（Windows 换行 \r\n 去掉 \r）
     if (node.hasNote()) {
-        var it = std.mem.splitScalar(u8, node.note.items, '\n');
+        var it = std.mem.splitScalar(u8, node.note.slice(), '\n');
         while (it.next()) |line_raw| {
             const line = if (std.mem.endsWith(u8, line_raw, "\r")) line_raw[0 .. line_raw.len - 1] else line_raw;
             if (line.len == 0) continue;

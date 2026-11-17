@@ -2,6 +2,7 @@
 //! 只管数据，不依赖 UI / I/O —— 序列化见 xml.zig，布局见 layout.zig。
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const zstring = @import("zstring.zig");
 
 /// 视图层几何信息。
 /// x/y/w/h 每帧由 layout 重新计算；ox/oy 是用户拖拽偏移，叠加在自动布局之上，
@@ -45,7 +46,7 @@ pub const Rgba = struct {
 };
 
 /// 节点属性表的一行。name/value 用 ArrayList 以便 dvui textEntry 直接绑定
-/// （与 Node.text/note/link 同款模式）。
+/// （标题/正文/连线标题已改用不可变 ZString，见 zstring.zig）。
 pub const Property = struct {
     name: std.ArrayList(u8) = .empty,
     value: std.ArrayList(u8) = .empty,
@@ -56,12 +57,11 @@ pub const Property = struct {
 /// 图片数据只存一份（不再内联进 `<node>`），节点只保留 `img_ref`（= 本项 id）：
 /// 同一张图片被多个节点引用时不重复存储，保存/读取都只有一份 base64。
 pub const ImageAsset = struct {
-    /// 资源 id：内容寻址，取图片内容的 md5 十六进制（32 位小写）。
-    /// 「同一图片」= 内容相同 → md5 相同 → 复用同一 id（见 ImageStore.ensure）。
+    /// 资源 id：uuid（32 位小写十六进制），加载图片时随机生成。
     id: std.ArrayList(u8) = .empty,
     /// 图片类型（文件后缀 jpg / png）。
     img_type: std.ArrayList(u8) = .empty,
-    /// 内容 md5（十六进制，与 id 相同；单独存一份，读取/校验时可直接比对）。
+    /// 内容 md5（十六进制，用于快速比较图片是否相同：先比 md5，相同再比真实内容）。
     md5: std.ArrayList(u8) = .empty,
     /// 图片原始二进制（保存时才做 base64 编码）。
     data: std.ArrayList(u8) = .empty,
@@ -104,8 +104,7 @@ pub const ImageStore = struct {
         return null;
     }
 
-    /// 直接登记一项（读取 XML 时用：id/type/md5 已由文件给出）。
-    /// id 为空或已存在时按 md5 计算 id 并复用已有项。返回该资源。
+    /// 直接登记一项（读取 XML 时用：id/type/md5 已由文件给出）。返回该资源。
     pub fn add(
         self: *ImageStore,
         gpa: Allocator,
@@ -124,13 +123,17 @@ pub const ImageStore = struct {
         return &self.items.items[self.items.items.len - 1];
     }
 
-    /// 按内容登记图片并返回其 id：md5 已存在则直接复用（不重复存数据）。
-    /// 返回的切片指向资源自身的 id 缓冲，不随 items 扩容失效。
+    /// 按内容登记图片并返回其 uuid：先比 md5，相同再比真实内容，一致则复用已有 uuid
+    /// （不重复存数据）；否则生成新 uuid 加入池。返回的切片指向资源自身的 id 缓冲。
     pub fn ensure(self: *ImageStore, gpa: Allocator, img_type: []const u8, data: []const u8) ![]const u8 {
         var hexbuf: [32]u8 = undefined;
         const hex = md5Hex(data, &hexbuf);
-        if (self.findByMd5(hex)) |a| return a.id.items;
-        const a = try self.add(gpa, hex, img_type, hex, data);
+        if (self.findByMd5(hex)) |a| {
+            if (std.mem.eql(u8, a.data.items, data)) return a.id.items;
+        }
+        var uuidbuf: [8]u8 = undefined;
+        const id = uuidHex(&uuidbuf);
+        const a = try self.add(gpa, id, img_type, hex, data);
         return a.id.items;
     }
 };
@@ -147,18 +150,30 @@ pub fn md5Hex(data: []const u8, out: *[32]u8) []const u8 {
     return out[0..32];
 }
 
+var g_uuid_counter: u64 = 0;
+
+/// 生成 8 位小写十六进制 uuid（计数器，进程内唯一），out 至少 8 字节。
+pub fn uuidHex(out: *[8]u8) []const u8 {
+    g_uuid_counter += 1;
+    _ = std.fmt.bufPrint(out[0..8], "{x:0>8}", .{g_uuid_counter}) catch unreachable;
+    return out[0..8];
+}
+
 pub const Node = struct {
     id: u32,
     /// 导出排序值：文档导出（docx/markdown）时子节点按 seq * 10_000_000 + id
     /// 升序排列（u64）。没有 seq 的节点取默认值 0。随 XML 持久化。
     seq: u64 = 0,
-    /// 标题（必显示）
-    text: std.ArrayList(u8) = .empty,
+    /// 标题（必显示）。不可变字符串（copyOnWrite）：赋值/克隆只是共享引用，
+    /// 改值必须经 StringStore 构造新串（setText/setNote/setLink），
+    /// 撤销快照因此与当前树共享文本字节，不再逐字复制。字节归 Doc 的
+    /// StringStore 所有（不入快照、随文档销毁），节点本身不持有、不释放。
+    text: zstring.ZString = .empty,
     /// 正文描述（可选；为空时节点只渲染标题，非空时以略小字体显示在标题下方）
-    note: std.ArrayList(u8) = .empty,
+    note: zstring.ZString = .empty,
     /// 连接线标题（可选）：本节点与父节点之间那条连线的标签，如「依赖」「包含」。
     /// 存在子节点自己身上（边的另一端就是父节点），根节点没有父连线故此字段无意义。
-    link: std.ArrayList(u8) = .empty,
+    link: zstring.ZString = .empty,
     /// 自定义背景色（可选；null = 跟随主题默认）。
     bg: ?Rgba = null,
     /// 用户手动调整的节点尺寸（拖拽右/下边缘得到；null = 跟随自动布局）。
@@ -180,9 +195,8 @@ pub const Node = struct {
     pub fn deinit(self: *Node, gpa: Allocator) void {
         for (self.children.items) |c| c.deinit(gpa);
         self.children.deinit(gpa);
-        self.text.deinit(gpa);
-        self.note.deinit(gpa);
-        self.link.deinit(gpa);
+        // text/note/link 是 StringStore 的字节（引用语义），不由节点释放；
+        // 快照树与当前树共享同一份，统一在 Doc 的 StringStore.deinit 回收。
         self.img_ref.deinit(gpa);
         for (self.properties.items) |*p| {
             p.name.deinit(gpa);
@@ -199,31 +213,28 @@ pub const Node = struct {
 
     /// 是否有正文描述（决定布局是否预留第二行、画布是否渲染描述）。
     pub fn hasNote(self: *const Node) bool {
-        return self.note.items.len > 0;
+        return !self.note.isEmpty();
     }
 
     /// 是否有连接线标题（决定画布是否在连线中点渲染标签）。
     pub fn hasLink(self: *const Node) bool {
-        return self.link.items.len > 0;
+        return !self.link.isEmpty();
     }
 };
 
-/// 覆盖式写入标题。
-pub fn setText(gpa: Allocator, node: *Node, s: []const u8) !void {
-    node.text.clearRetainingCapacity();
-    try node.text.appendSlice(gpa, s);
+/// 覆盖式写入标题：构造新 ZString（copyOnWrite），旧串留给撤销快照继续引用。
+pub fn setText(store: *zstring.StringStore, node: *Node, s: []const u8) !void {
+    node.text = try store.create(s);
 }
 
 /// 覆盖式写入正文描述（传空串即清除描述，节点退回只显示标题）。
-pub fn setNote(gpa: Allocator, node: *Node, s: []const u8) !void {
-    node.note.clearRetainingCapacity();
-    try node.note.appendSlice(gpa, s);
+pub fn setNote(store: *zstring.StringStore, node: *Node, s: []const u8) !void {
+    node.note = try store.create(s);
 }
 
 /// 覆盖式写入连接线标题（传空串即清除标签，连线恢复为无标题）。
-pub fn setLink(gpa: Allocator, node: *Node, s: []const u8) !void {
-    node.link.clearRetainingCapacity();
-    try node.link.appendSlice(gpa, s);
+pub fn setLink(store: *zstring.StringStore, node: *Node, s: []const u8) !void {
+    node.link = try store.create(s);
 }
 
 /// 覆盖式写入节点图片引用（传空串即清除引用；资源本身留在文档图片池里）。
@@ -271,31 +282,32 @@ pub fn removeProperty(gpa: Allocator, node: *Node, idx: usize) void {
     p.value.deinit(gpa);
 }
 
-pub fn createNode(gpa: Allocator, id: u32, text: []const u8) !*Node {
-    const n = try gpa.create(Node);
-    errdefer gpa.destroy(n);
-    n.* = .{ .id = id };
-    try n.text.appendSlice(gpa, text);
+/// 节点构造（标题复制进池）。节点树本身的分配用 store.gpa（同一个分配器）。
+pub fn createNode(store: *zstring.StringStore, id: u32, text: []const u8) !*Node {
+    const t = try store.create(text);
+    const n = try store.gpa.create(Node);
+    errdefer store.gpa.destroy(n);
+    n.* = .{ .id = id, .text = t };
     return n;
 }
 
 /// 在 parent 下追加子节点，并自动展开 parent。
-pub fn addChild(gpa: Allocator, parent: *Node, id: u32, text: []const u8) !*Node {
-    const n = try createNode(gpa, id, text);
-    errdefer n.deinit(gpa);
-    try parent.children.append(gpa, n);
+pub fn addChild(store: *zstring.StringStore, parent: *Node, id: u32, text: []const u8) !*Node {
+    const n = try createNode(store, id, text);
+    errdefer n.deinit(store.gpa);
+    try parent.children.append(store.gpa, n);
     n.parent = parent;
     parent.collapsed = false;
     return n;
 }
 
 /// 在 node 后插入同级节点；root 无同级，退化为添加子节点。
-pub fn addSibling(gpa: Allocator, node: *Node, id: u32, text: []const u8) !*Node {
-    const parent = node.parent orelse return addChild(gpa, node, id, text);
-    const n = try createNode(gpa, id, text);
-    errdefer n.deinit(gpa);
+pub fn addSibling(store: *zstring.StringStore, node: *Node, id: u32, text: []const u8) !*Node {
+    const parent = node.parent orelse return addChild(store, node, id, text);
+    const n = try createNode(store, id, text);
+    errdefer n.deinit(store.gpa);
     const idx = std.mem.indexOfScalar(*Node, parent.children.items, node) orelse return error.NotFound;
-    try parent.children.insert(gpa, idx + 1, n);
+    try parent.children.insert(store.gpa, idx + 1, n);
     n.parent = parent;
     return n;
 }
@@ -337,8 +349,11 @@ pub fn find(root: *Node, id: u32) ?*Node {
 }
 
 /// 深拷贝整棵子树，返回独立的镜像树（撤销/重做快照用）。
-/// 复制 id / seq / 文本 / 折叠状态 / geom（含拖拽偏移 ox/oy，否则撤销会把用户
+/// 复制 id / seq / 折叠状态 / geom（含拖拽偏移 ox/oy，否则撤销会把用户
 /// 手动挪过的节点弹回自动布局位置）；parent 指针在拷贝内部重建。
+/// **文本按引用共享**（ZString 是值类型，位拷贝即共享底层字节）：快照树与
+/// 当前树的标题/正文/连线标题是同一份内存，只有改值才分配新串——
+/// 这是把快照内存从 O(全树文本×快照数) 压到 O(改动量) 的关键。
 pub fn cloneTree(gpa: Allocator, node: *const Node) !*Node {
     const n = try gpa.create(Node);
     n.* = .{
@@ -349,11 +364,11 @@ pub fn cloneTree(gpa: Allocator, node: *const Node) !*Node {
         .user_w = node.user_w,
         .user_h = node.user_h,
         .geom = node.geom,
+        .text = node.text,
+        .note = node.note,
+        .link = node.link,
     };
     errdefer n.deinit(gpa);
-    try n.text.appendSlice(gpa, node.text.items);
-    try n.note.appendSlice(gpa, node.note.items);
-    try n.link.appendSlice(gpa, node.link.items);
     try n.img_ref.appendSlice(gpa, node.img_ref.items);
     try n.properties.ensureTotalCapacity(gpa, node.properties.items.len);
     for (node.properties.items) |p| {
@@ -389,11 +404,11 @@ pub fn cloneShallow(gpa: Allocator, node: *const Node) !*Node {
         .bg = node.bg,
         .user_w = node.user_w,
         .user_h = node.user_h,
+        .text = node.text,
+        .note = node.note,
+        .link = node.link,
     };
     errdefer n.deinit(gpa);
-    try n.text.appendSlice(gpa, node.text.items);
-    try n.note.appendSlice(gpa, node.note.items);
-    try n.link.appendSlice(gpa, node.link.items);
     try n.img_ref.appendSlice(gpa, node.img_ref.items);
     try n.properties.ensureTotalCapacity(gpa, node.properties.items.len);
     for (node.properties.items) |p| {
@@ -420,6 +435,16 @@ pub fn maxId(node: *Node) u32 {
     var m = node.id;
     for (node.children.items) |c| m = @max(m, maxId(c));
     return m;
+}
+
+/// 把子树里所有 ZString 标记为 GC 存活（app.zig 的 gcStrings 收根集合用）。
+/// 根集合 = 当前树 + 撤销/重做栈 + 各预备快照；**任何新出现的 ZString 持有地
+/// （比如把属性表也换成 ZString）都必须同步加进根集合，漏标 = 悬垂内存。**
+pub fn markStrings(g: *zstring.StringStore.Gc, node: *const Node) void {
+    g.mark(node.text);
+    g.mark(node.note);
+    g.mark(node.link);
+    for (node.children.items) |c| markStrings(g, c);
 }
 
 /// 折叠/展开整个子树（调用方自行决定 root 是否保持展开）。
